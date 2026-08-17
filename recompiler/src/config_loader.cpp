@@ -1983,6 +1983,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     bool ws_clear_reveal = false;
     bool ws_nw_flat_backdrop = false;
     bool ws_nw_phase_backdrop = false;
+    bool ws_nw_backdrop_rects = false;
     bool ws_nw_textured_edges = false;
     int ws_nw_textured_edge_scale = 0;
     bool ws_nw_full_mirror = false;
@@ -2200,6 +2201,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_nw_flat_backdrop = toml::find<bool>(ws, "nw_flat_backdrop");
         if (ws.contains("nw_phase_backdrop"))
             ws_nw_phase_backdrop = toml::find<bool>(ws, "nw_phase_backdrop");
+        if (ws.contains("nw_backdrop_rects"))
+            ws_nw_backdrop_rects = toml::find<bool>(ws, "nw_backdrop_rects");
         if (ws.contains("nw_textured_edges"))
             ws_nw_textured_edges = toml::find<bool>(ws, "nw_textured_edges");
         if (ws.contains("nw_textured_edge_scale")) {
@@ -2843,6 +2846,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_clear_reveal*/       ws_clear_reveal,
         /*ws_nw_flat_backdrop*/   ws_nw_flat_backdrop,
         /*ws_nw_phase_backdrop*/  ws_nw_phase_backdrop,
+        /*ws_nw_backdrop_rects*/  ws_nw_backdrop_rects,
         /*ws_nw_textured_edges*/ ws_nw_textured_edges,
         /*ws_nw_textured_edge_scale*/ ws_nw_textured_edge_scale,
         /*ws_nw_full_mirror*/ ws_nw_full_mirror,
