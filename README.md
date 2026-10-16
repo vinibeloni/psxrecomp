@@ -4,6 +4,8 @@
 
 # PSXRecomp
 
+> ℹ️ **Note from mstan:** This repo and I are now part of [RetroPortingToolkit](https://retroportingtoolkit.com/). I remain a primary maintainer of psxrecomp alongside the team. [More info](https://1379.tech/forming-a-collective-retro-porting-toolkit/).
+
 **A general-purpose static recompiler for the PlayStation 1.** It turns a PS1
 disc into a native executable — MIPS R3000A translated to C, compiled to x64,
 linked against a hardware-accurate runtime. Not an emulator: the game becomes a
@@ -48,6 +50,7 @@ coverage continue to improve per title.
 | *Mega Man X6* | [MegaManX6Recomp](https://github.com/mstan/MegaManX6Recomp) | [releases](https://github.com/mstan/MegaManX6Recomp/releases/latest) | Playable; stages, controller, save/load; 2D widescreen to 21:9. |
 | *Tsumu Light* | [TsumuLightRecomp](https://github.com/mstan/TsumuLightRecomp) | [releases](https://github.com/mstan/TsumuLightRecomp/releases/latest) | Japanese-only title (SLPS-02253); first consumer of [live language switching](#swap-language-on-the-fly). |
 | *Xenogears* — **community** | [OpokXeno/xenogears-recomp](https://github.com/OpokXeno/xenogears-recomp) | — | Independent project by [@OpokXeno](https://github.com/OpokXeno), who also contributed widescreen cull-site work upstream. |
+| *Mega Man Legends* — **community** | [VuloB1/MegaManLegendsRecomp](https://github.com/VuloB1/MegaManLegendsRecomp) | [releases](https://github.com/VuloB1/MegaManLegendsRecomp/releases/latest) | Native 16:9 widescreen, analog movement with right-stick camera, 60/120 Hz presentation, skip FMVs, PGXP precision. |
 
 Each game repo carries its own build/run instructions, keyboard/controller
 mappings, and per-game settings. **This repository builds the framework and a
@@ -55,8 +58,10 @@ standalone BIOS runtime supporting OpenBIOS and a compatible retail BIOS** —
 see [Release Package](#release-package) below.
 
 Bringing up a title of your own? Start with
-[`CONTRIBUTING.md`](CONTRIBUTING.md) and open an issue — community projects are
-listed here alongside the rest.
+[`docs/GAME_PROJECT_SETUP.md`](docs/GAME_PROJECT_SETUP.md) (submodules,
+bundled-release CI template, release checklist), then
+[`CONTRIBUTING.md`](CONTRIBUTING.md). Community projects are listed here
+alongside the rest.
 
 ## What It Is
 
@@ -81,10 +86,12 @@ Three things sit on that foundation:
   works on both linked BIOS backends — the bundled OpenBIOS and a player's
   retail BIOS dump reach the game the same way — while the kernel-call half is
   enabled per image and says so at startup when it isn't.
-- **Capture-and-compile for overlays.** PS1 games stream code off the disc at
-  runtime (*overlays*) that no ahead-of-time recompiler can see. PSXRecomp
-  captures each overlay the moment it loads and recompiles it to native code,
-  cached and reused forever after (`static → gcc → tcc` backend).
+- **Ahead-of-time overlay sharding.** PS1 games stream code from disc into
+  reused RAM addresses. When the stored bytes and loader behavior are known,
+  PSXRecomp can discover and compile those overlays before gameplay, without a
+  full decompilation. The runtime selects matching native code using byte guards.
+  Capture-and-compile remains available for gaps. See the
+  [AOT sharding guide](docs/AOT_SHARDING.md) for the reusable workflow and limits.
 - **A general-purpose interpreter — as a transient safety net, not a fixture.**
   Anything not yet native (a freshly streamed overlay, RAM-installed code) runs
   in a small MIPS interpreter so the machine is always *correct*. But the
@@ -95,15 +102,142 @@ Three things sit on that foundation:
   execution.
 
 PSXRecomp is a **framework**. Game-specific projects live in their own
-repositories and link this one in as a **git submodule** to build a game binary.
+repositories with **`psxrecomp/` and `recomp-ui/` as root-level submodules**
+and game code (`game.toml`, seeds, CMake) at the repo root. See
+[`docs/GAME_PROJECT_SETUP.md`](docs/GAME_PROJECT_SETUP.md).
 
-**New here?** The fastest way in:
-[`docs/EXECUTION_MODEL.md`](docs/EXECUTION_MODEL.md) (how a game actually
-runs — static / native-overlay / interpreter), then
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
-[`docs/BUILDING.md`](docs/BUILDING.md),
-[`docs/MOD_PACKAGES.md`](docs/MOD_PACKAGES.md) (versioned runtime mods),
-[`CONTRIBUTING.md`](CONTRIBUTING.md).
+## Getting Started
+
+### Build requirements
+
+Every platform needs **Git**, **Python 3**, **CMake 3.20+**, **Ninja**, and a
+C/C++ compiler (the recompiler is C++20; the runtime is C99 + C++17). SDL3 is
+fetched automatically if no system package is found.
+
+**Windows** (PowerShell)
+
+```powershell
+winget install Git.Git Python.Python.3.12
+```
+
+Git for Windows also provides the `bash` the setup script uses. Then pick one
+of these for the compiler, CMake, and Ninja:
+
+- **Bundled toolchain (recommended).** Download `cmake-clang-v1-windows-x64.zip`
+  from [retcomm-toolchains](https://github.com/RetroPortingToolKit/RetroPorting-Toolchains/releases/latest),
+  unzip it (for example to `C:\retcomm-toolchain`), and in the PowerShell
+  window you will run the setup from:
+
+  ```powershell
+  $env:PSXRECOMP_TOOLCHAIN_DIR = "C:\retcomm-toolchain"
+  $env:Path = "C:\retcomm-toolchain\bin;$env:Path"
+  ```
+
+- **Visual Studio.** Install
+  [Build Tools for Visual Studio 2022](https://visualstudio.microsoft.com/downloads/)
+  with the "Desktop development with C++" workload, plus
+  `winget install Kitware.CMake Ninja-build.Ninja`, and run the setup from a
+  "Developer PowerShell for VS 2022" window.
+
+**macOS**
+
+```sh
+xcode-select --install
+brew install git cmake ninja python
+```
+
+**Linux** (Debian/Ubuntu)
+
+```sh
+sudo apt install git build-essential cmake ninja-build python3
+```
+
+Linux and macOS users can also use the bundled toolchain pack instead of a
+system compiler: `tools/fetch_toolchain.sh --artifact <linux-x64|macos-arm64|macos-x64>`
+unpacks it and prints the directory to export. The full dependency table,
+MSYS2 notes, and troubleshooting are in [`docs/BUILDING.md`](docs/BUILDING.md).
+
+### Set up a game project (recommended)
+
+#### Source Code Required
+
+Clone the master branch of this repo with submodules, or download one of the latest nightly releases.  You store this wherever you like on your project space, as it's own project - you do NOT build your recomp game data inside the psxrecomp folder.
+
+#### New Project Scaffolding
+
+Run the setup script. Pass your disc
+(`.cue`) and, optionally, a legally obtained retail BIOS dump. The script
+prompts for everything else; answer **Y** to Generate to produce the game and
+BIOS C. The new project is created under `--dir` / `-Dir` with the name you
+choose.
+
+**Windows**
+
+```powershell
+# Disc + BIOS
+powershell -File tools\new_project_layout\setup_project.ps1 `
+  -Disc C:\dumps\game.cue -Bios C:\BIOS\SCPH1001.BIN -Dir C:\src
+
+# Multi-disc + BIOS: scaffold from disc 1, then register the whole set
+powershell -File tools\new_project_layout\setup_project.ps1 `
+  -Disc C:\dumps\game-disc1.cue -Bios C:\BIOS\SCPH1001.BIN -Dir C:\src
+python tools\new_project_layout\update_disc_set.py --game-toml C:\src\MyGameRecomp\game.toml `
+  C:\dumps\game-disc1.cue C:\dumps\game-disc2.cue C:\dumps\game-disc3.cue
+```
+
+**macOS / Linux**
+
+```sh
+# Disc + BIOS
+sh tools/new_project_layout/setup_project.sh \
+  --disc ~/dumps/game.cue --bios ~/bios/SCPH1001.BIN --dir ~/src
+
+# Multi-disc + BIOS: scaffold from disc 1, then register the whole set
+sh tools/new_project_layout/setup_project.sh \
+  --disc ~/dumps/game-disc1.cue --bios ~/bios/SCPH1001.BIN --dir ~/src
+python3 tools/new_project_layout/update_disc_set.py --game-toml ~/src/MyGameRecomp/game.toml \
+  ~/dumps/game-disc1.cue ~/dumps/game-disc2.cue ~/dumps/game-disc3.cue
+```
+
+Then build with the generated `build.ps1` / `build.sh` in the new project.
+Full flow, every flag, CI, and the release checklist:
+[`docs/GAME_PROJECT_SETUP.md`](docs/GAME_PROJECT_SETUP.md).
+
+#### Project Folder Structure
+
+After running the project setup wizard script as per above, you will have a project layout made for you, as seen here:
+
+<img width="910" height="567" alt="image" src="https://github.com/user-attachments/assets/3ef66dec-b594-4332-8067-307a23ee1f21" />
+
+These are the 3 most important folders to be aware of:
+
+**psxrecomp** This is the module for the runtime engine.  It also contains nested submodules under lib/recomp-net and lib/retcomm-rbengine which are used for netplay connectivity, and also for certain offline features as well like frame rewind.
+
+**recomp-ui** This module is for the UI.  It handles user interface at the startup of the released/compiled program for configuring controls, settings, a netplay browser, and also manages setup wizards for self-compilation on end user machines.
+
+**mods/preloaded** in this directory, mod manifests are stored which catalog the mods available for the title.  Adding new mods requires an additonal manifest or an entry in an existing manifest.
+
+**Other Folders** the other folders produced are generated from template files by the setup script run above, which provide various features and tools specific to the title itself and might be referenced by the compiler, or by diagnostics/dev software.
+
+### New here? 
+
+**The fastest way in:**
+
+| Path | Doc |
+|------|-----|
+| How a game runs | [`docs/EXECUTION_MODEL.md`](docs/EXECUTION_MODEL.md) |
+| Architecture | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
+| **AOT overlay sharding** (disc discovery, per-game recipes, validation) | [`docs/AOT_SHARDING.md`](docs/AOT_SHARDING.md) |
+| Build the framework | [`docs/BUILDING.md`](docs/BUILDING.md) |
+| **Ship a game repo** (submodules + CI + release checklist) | [`docs/GAME_PROJECT_SETUP.md`](docs/GAME_PROJECT_SETUP.md) |
+| **Netplay** (rollback, SFU/ICE, dual-raster, disc gates) | [`docs/NETPLAY.md`](docs/NETPLAY.md) |
+| Bundled-release CI template | [`docs/ci/templates/game-release.yml`](docs/ci/templates/game-release.yml) |
+| Local Generate & rebuild CLI | [`docs/LOCAL_CODEGEN_SDK.md`](docs/LOCAL_CODEGEN_SDK.md) |
+| Mods | [`docs/MOD_PACKAGES.md`](docs/MOD_PACKAGES.md) |
+| Widescreen / native-wide | [`docs/WIDESCREEN.md`](docs/WIDESCREEN.md) |
+| Enhancement tier (PGXP, renderers, load accel) | [`docs/ENHANCEMENTS.md`](docs/ENHANCEMENTS.md) |
+| TCP debug command reference | [`docs/TCP_COMMANDS.md`](docs/TCP_COMMANDS.md) |
+| Contributing | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
 
 ## Which PlayStation BIOS does it use?
 
@@ -163,7 +297,7 @@ have to be widened in step with the renderer.
   <tr><td align="center"><sub><b>Tomba! 2 — adaptive.</b> The view tracks the window, up to an ultrawide cap.</sub></td></tr>
 </table>
 
-See [`WIDESCREEN.md`](WIDESCREEN.md) for the per-game configuration.
+See [`docs/WIDESCREEN.md`](docs/WIDESCREEN.md) for the per-game configuration.
 
 ## Mods
 
@@ -252,6 +386,7 @@ Choose the narrowest mechanism that describes the change:
 | A player-selectable boolean, choice, or number | Feature-local `[[option]]` plus `when`, `replace_from`, sparse `fields`, or `when_integer` |
 | Artwork, script, audio, or another large disc asset | Hashed file-backed `[[overlay]]`; do not rebuild the player's stock image |
 | Host setting or live game behavior | Trusted static `[[plugin]]`, compiled into the game and selected by a stable id |
+| OpenGL bezel artwork | A disabled-by-default package using the trusted `psx.bezel` plugin and a user-selected image resource |
 | Several features composing one shared table, bitfield, routine, or allocation | Game-owned `resolver = "builtin:<id>"`, only when declarative operations cannot express the composition |
 
 Format versions 2–4 add bounded integers, ordered constraints, linked MIPS
@@ -392,100 +527,7 @@ supersampling         = 2
 
 Both are visual-only: the GTE's guest-visible screen coordinates stay integer
 and fully faithful, so game logic and culling are unaffected. Supported on all
-three renderers. See [`ENHANCEMENTS.md`](ENHANCEMENTS.md) §G1.
-
-## How to use PSXRecomp
-
-PSXRecomp takes a PlayStation disc image and creates a recompilation project
-that supports the bundled OpenBIOS and a compatible retail BIOS. The CLI asks
-for a retail BIOS dump so it can generate that backend alongside OpenBIOS.
-
-### Generate a project with the released CLI
-
-1. Download `psxrecomp-cli-windows-x86_64.zip` from
-   [Releases](https://github.com/mstan/psxrecomp/releases).
-2. Extract the whole zip to a folder. Keep its contents together.
-3. Open PowerShell in that folder and run:
-
-```powershell
-.\psxrecomp.exe build `
-  --disc "C:\Games\My Game\game.cue" `
-  --bios "C:\BIOS\SCPH1001.BIN" `
-  --output "C:\Projects\MyGameRecomp"
-```
-
-Use the `.cue` file when a game has one, and keep its `.bin` track files beside
-it. Single-file `.bin` and `.iso` images are also accepted.
-
-The output folder contains:
-
-- generated C source for the game and compatible retail BIOS, with the bundled
-  OpenBIOS backend supplied by the framework;
-- `game.toml`, which you can edit for game-specific settings;
-- `CMakeLists.txt` and build scripts; and
-- a local copy of the PSXRecomp runtime source needed by the project.
-
-The downloaded CLI is self-contained. You do not need to install Python or
-build this repository to generate a project.
-
-### Build the generated project
-
-Install CMake, Ninja, and a C/C++ compiler. The build fetches its integrity-
-pinned SDL3 release automatically. Then run:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File "C:\Projects\MyGameRecomp\build.ps1"
-```
-
-The generated project also includes a shell build script for macOS and Linux:
-
-```sh
-sh /path/to/MyGameRecomp/build.sh
-```
-
-The ready-made CLI release is currently for 64-bit Windows. You can build the
-CLI from source on another operating system using the instructions below.
-
-The generated project is a practical starting point, not a promise that every
-game works without game-specific fixes. PSX games can load extra code and use
-hardware in ways that require additional configuration or development.
-
-Use only disc and retail BIOS files you obtained legally. PSXRecomp does not
-include those copyrighted files; it includes only the redistributable OpenBIOS
-image. Generated game and retail BIOS source is derived from your files, so do
-not redistribute it.
-
-### Build the CLI from source
-
-You need Git, Python 3, CMake, Ninja, and a C++20 compiler.
-
-```sh
-git clone --recurse-submodules https://github.com/mstan/psxrecomp.git
-cd psxrecomp
-python tools/build_cli.py release
-```
-
-The ready-to-use CLI archive is written to `dist/`. To package debug binaries
-instead, run `python tools/build_cli.py debug`.
-
-On Linux/macOS source checkouts, the same development setup can be driven by:
-
-```sh
-sh tools/setup_dev.sh
-```
-
-That script builds the CLI/recompiler tools and, when the OpenBIOS and retail
-BIOS generated sources are available, the standalone BIOS runtime. Game
-projects should still be generated with `psxrecomp build` and built from their
-generated `build.sh`.
-
-> **Where the project is headed.** Development so far has been **breadth-first**:
-> bring up varied games as playable public builds and prove that the framework
-> generalizes. With that foundation established, the project is now focused on a
-> **depth / optimization** phase: pushing each game toward 100% static coverage,
-> tightening timing accuracy, driving load times toward zero, and hardening the
-> renderer and audio paths. Expect existing projects to get *faster and more
-> accurate* from here.
+three renderers. See [`docs/ENHANCEMENTS.md`](docs/ENHANCEMENTS.md) §G1.
 
 ## Release Package
 
@@ -512,6 +554,14 @@ configures video, controls, and per-game settings. Keyboard/controller mappings
 live in each game's repo and launcher, not here.
 
 ## Philosophy — toward 100% static recompilation
+
+> **Where the project is headed.** Development so far has been **breadth-first**:
+> bring up varied games as playable public builds and prove that the framework
+> generalizes. With that foundation established, the project is now focused on a
+> **depth / optimization** phase: pushing each game toward 100% static coverage,
+> tightening timing accuracy, driving load times toward zero, and hardening the
+> renderer and audio paths. Expect existing projects to get *faster and more
+> accurate* from here.
 
 The goal is simple and absolute: **a PS1 game should run as native code, not be
 emulated.** Every MIPS instruction the game executes should ideally have been
@@ -695,10 +745,28 @@ The runtime models **authentic 1× CD-ROM timing by default** — the same read 
 seek delays as real hardware. On top of that faithful baseline, load-time
 acceleration is **opt-in**, per game, so the accurate path is never compromised:
 
-- **Turbo** — a hold-to-fast-forward key that compresses loads on demand.
-- **`[runtime] turbo_loads` / `idle_skip`** — automatic acceleration during load
-  waits, with `turbo_audio_sink` keeping the SPU timeline coherent through the
-  burst.
+- **Turbo** — a hold-to-fast-forward key that compresses loads on demand
+  (keyboard `[KeyMap] Turbo`, default Tab; controller `[hotkeys]
+  fast_forward_pad`, default Select+L1, rebindable under the launcher's
+  Controller → Host Shortcuts alongside Rewind and Save states). A
+  press-to-latch twin, **Turbo toggle** (`[KeyMap] TurboToggle`, default F9;
+  `[hotkeys] fast_forward_toggle_pad`, unbound by default), locks the same
+  speed until pressed again. Controller host shortcuts bound to a single
+  button or trigger are chords with Select — the launcher shows them as
+  `select + …`; only a two-button capture replaces the implicit Select.
+  Backspace while the launcher is listening clears a shortcut; in the files
+  that is `0` for a `[hotkeys]` pad value and `None` for a `[KeyMap]` key (a
+  present-but-empty or `None` line is an explicit unbind, a missing line
+  keeps the built-in default).
+- **The "Fast Loading (host pacing)" and "CD Speed" mods** — automatic
+  acceleration during load waits, shipped with every title and **off by
+  default**, with `turbo_audio_sink` keeping the SPU timeline coherent through
+  the burst. Host pacing only changes how fast real time is fed to a load, so
+  the guest cannot desync; CD speed changes when the game receives CD
+  interrupts. The former `[runtime] turbo_loads` config key is deprecated and
+  ignored — see `docs/config_schema.md`.
+- **`[runtime] idle_skip`** — proof-gated fast-forward through idle polling
+  loops, with guest time and device events still advancing exactly.
 - **Warm CD routes (`[[runtime.warm_cd_routes]]`)** — narrowly-scoped fast
   read cadence armed on a specific `SetLoc`, restoring authentic timing the
   moment the read pattern diverges.
@@ -744,17 +812,27 @@ the selected faithfully recompiled BIOS — OpenBIOS or retail BIOS — is the
 baseline and oracle, generated code is never hand-edited (fix the recompiler and
 regenerate), and a change proves itself against the Beetle oracle / on screen
 rather than by assertion. Game-specific work lives in the game repos, which pin
-an exact framework commit as a submodule.
+exact framework and UI commits as root-level submodules.
 
-Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a PR — it covers the core
-rules, how to verify a change, the regression checklist across the known games,
-and how a framework fix reaches a game through its pin. Bugs and build problems go
-to GitHub issues (include `gcc -v` / OS / generator for build failures); design
-discussion happens in the **R.A.I.D.** Discord (invite below).
+- New title / bundled release:
+  [`docs/GAME_PROJECT_SETUP.md`](docs/GAME_PROJECT_SETUP.md)
+- Framework PRs: [`CONTRIBUTING.md`](CONTRIBUTING.md) (rules, verification,
+  regression checklist, how a fix reaches a game through its pin)
+
+Bugs and build problems go to GitHub issues (include `gcc -v` / OS / generator
+for build failures); design discussion happens in the **R.A.I.D.** Discord
+(invite below).
 
 ## License
 
-PolyForm Noncommercial 1.0.0. See `LICENSE`.
+PolyForm Noncommercial 1.0.0. See `LICENSE`. Copyright © 2026 Matthew
+Stanley; commercial licensing inquiries go to him at <https://1379.tech>.
+
+Third-party components vendored into the runtime keep their own terms, and
+their notices ship with every release under `licenses/` in the package
+(sources in [`runtime/licenses/`](runtime/licenses)). See
+[`THIRD_PARTY_ATTRIBUTION.md`](THIRD_PARTY_ATTRIBUTION.md) for what is
+vendored and why.
 
 Retail PS1 BIOS images and game disc images remain copyrighted by their
 respective owners and are not distributed. This project does distribute the

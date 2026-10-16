@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <set>
@@ -16,6 +17,7 @@
 #include "fmt/format.h"
 #include "mips_decoder.h"
 #include "strict_translator.h"
+#include "write_if_changed.h"
 #include "../../runtime/include/psx_instr_cost.h"  /* single-source CPU cycle cost (shared with interp + game emitter) */
 
 namespace PSXRecompV4 {
@@ -104,8 +106,18 @@ static uint32_t ram_alias_to_rom(uint32_t addr) {
  * BIOS copies kernel/shell code into RAM. Literal interrupt resume PCs must use
  * this runtime address; otherwise psx_check_interrupts rejects ROM-shell EPCs
  * and falls back to the legacy sentinel path. */
+/* The segment of the variant being emitted (docs/SEGMENT_AWARE_CODE.md §5.4),
+ * or kNoVariant while emitting the home bodies. A variant is the same ROM
+ * bytes run at another segment's alias of their runtime window: every PC it
+ * computes from its own PCs (links, fetch tags and the uncached-fetch test,
+ * IRQ resume PCs, branch and fallthrough targets, EPCs, store PCs) is in that
+ * segment, and a J target keeps the segment's top bits. */
+static constexpr uint32_t kNoVariant = 0xFFFFFFFFu;
+static uint32_t g_variant_seg = kNoVariant;
+
 static uint32_t bios_runtime_pc(uint32_t rom_pc) {
-    return addr_model().runtime_pc(rom_pc);
+    const uint32_t pc = addr_model().runtime_pc(rom_pc);
+    return g_variant_seg == kNoVariant ? pc : (g_variant_seg | (pc & 0x1FFFFFFFu));
 }
 
 uint32_t FullFunctionEmitter::read_u32_le(const std::vector<uint8_t>& rom, uint32_t offset) {
@@ -149,9 +161,20 @@ bool FullFunctionEmitter::emit_function(
     uint32_t                    /* rom_end */,
     std::vector<ContinuationLabel>& out_continuations,
     const std::set<uint32_t>&   injected_cross_targets,
-    std::vector<ContinuationLabel>& out_cross_targets)
+    std::vector<ContinuationLabel>& out_cross_targets,
+    std::string*                out_interpreter_reason)
 {
-    const uint32_t norm = func.normalized_addr;
+    // A home body is keyed (and named) by its normalized address; a segment
+    // variant by its exact runtime PC, which the dispatch compares in full.
+    const bool variant = g_variant_seg != kNoVariant;
+    const uint32_t norm = variant ? bios_runtime_pc(func.entry_addr) : func.normalized_addr;
+    if (out_interpreter_reason) out_interpreter_reason->clear();
+    // Dispatch key of a continuation label inside this body: its normalized
+    // address at home, its exact runtime PC in a variant. (Membership tests
+    // against the function-entry set stay normalized.)
+    auto cont_key = [&](uint32_t rom, uint32_t home_norm) -> uint32_t {
+        return variant ? bios_runtime_pc(rom) : home_norm;
+    };
 
     // RECURSION_BUG.md §25 — continuation-passing call/return (the universal fix
     // for the idle-freeze host-stack leak). When PSX_CPS is set at gen time,
@@ -237,7 +260,7 @@ bool FullFunctionEmitter::emit_function(
         uint32_t cross_norm = normalize_address(cross);
         if (all_function_entries_norm.count(cross_norm)) continue;
         block_leaders.insert(cross);
-        local_continuations.push_back({cross, cross_norm, norm});
+        local_continuations.push_back({cross, cont_key(cross, cross_norm), norm});
     }
 
     // FAITHFUL_TIMING_PLAN P5 / game code_generator.cpp parity: every basic-block
@@ -247,11 +270,22 @@ bool FullFunctionEmitter::emit_function(
     // dominated by kernel poll-loop leaders 0x45FC/0x4614 inside func_00004498 —
     // both had labels/gotos but no dispatch entries (only jal+8 conts were registered).
     // Entry block is already a function dispatch key; skip it. Dedup later.
+    // Split before computing cycle totals and load-delay boundaries. Guards
+    // precede all replaced instructions, including interior branch targets.
+    for (const auto& [pc, word] : addr_to_raw) {
+        (void)word;
+        const uint32_t ram_pc = addr_model().rom_to_ram_phys(pc);
+        for (const auto& slot : addr_model().install_slots()) {
+            if ((ram_pc >= slot.ram_addr && ram_pc < slot.hi()) ||
+                ram_pc == slot.resume_addr())
+                block_leaders.insert(pc);
+        }
+    }
     for (uint32_t leader : block_leaders) {
         if (!addr_to_raw.count(leader)) continue;
         uint32_t leader_norm = normalize_address(leader);
         if (all_function_entries_norm.count(leader_norm)) continue;
-        local_continuations.push_back({leader, leader_norm, norm});
+        local_continuations.push_back({leader, cont_key(leader, leader_norm), norm});
     }
 
     // Helper: find which function (in all_function_entries_norm) contains a
@@ -291,10 +325,6 @@ bool FullFunctionEmitter::emit_function(
     // continuation entry-switch after we know which labels exist.
     std::string branch_decls;
     std::string body;
-    // Shadow 'out' with a reference to 'body' so all existing out+= lines
-    // write to the temporary buffer.  The real 'out' is assembled at the end.
-    std::string& func_out = body;
-    #define out func_out
 
     // --- Emit instructions in address order ---
     // Delay slots are emitted at their natural address (NOT inline with
@@ -322,7 +352,10 @@ bool FullFunctionEmitter::emit_function(
     // on the upper 4 bits of the PC. The code runs at RAM addresses, not ROM
     // addresses, so we must fix J/JAL targets in the branch resolution.
     auto relocate_j_target = [](uint32_t rom_addr, uint32_t target) -> uint32_t {
-        return addr_model().relocate_j_target(rom_addr, target);
+        const uint32_t t = addr_model().relocate_j_target(rom_addr, target);
+        // A variant's J target keeps the variant PC's top bits (§2).
+        return g_variant_seg == kNoVariant
+            ? t : ((bios_runtime_pc(rom_addr) & 0xF0000000u) | (t & 0x0FFFFFFFu));
     };
 
     /* Relocate a return address ($ra) from ROM PC to the runtime address.
@@ -337,7 +370,9 @@ bool FullFunctionEmitter::emit_function(
     // First pass: identify terminators and their delay slots.
     for (const auto& [addr, raw] : addr_to_raw) {
         PSXRecomp::DecodedInstruction d = PSXRecomp::MipsDecoder::decode(raw, addr);
-        TranslateResult tr = StrictTranslator::translate(d);
+        // Only terminator metadata is read here, and it stays in ROM space;
+        // every translation in this emitter still gets its runtime PC (§5.2).
+        TranslateResult tr = StrictTranslator::translate(d, relocate_ra(addr));
         if (tr.is_terminator) {
             PendingBranch pb;
             pb.kind = tr.terminator_kind ? tr.terminator_kind : "";
@@ -352,6 +387,24 @@ bool FullFunctionEmitter::emit_function(
             }
             uint32_t ds_addr = addr + 4;
             pending_at[ds_addr] = pb;
+        }
+    }
+
+    // A guard cannot unwind a live branch/load delay using only a PC. Leave
+    // such a RAM-backed body on the existing fail-closed interpreter path;
+    // never widen the declared bytes to conceal an unsafe boundary.
+    for (const auto& [pc, word] : addr_to_raw) {
+        (void)word;
+        const uint32_t ram_pc = addr_model().rom_to_ram_phys(pc);
+        if (!addr_model().is_install_slot(ram_pc)) continue;
+        const auto previous = addr_to_raw.find(pc - 4u);
+        const bool prior_load = previous != addr_to_raw.end() &&
+            (previous->second >> 26) >= 0x20u && (previous->second >> 26) <= 0x26u;
+        if (pending_at.count(pc) || prior_load) {
+            if (out_interpreter_reason)
+                *out_interpreter_reason = fmt::format(
+                    "patch range at RAM 0x{:08X} crosses a branch/load delay boundary", ram_pc);
+            return false;
         }
     }
 
@@ -498,6 +551,18 @@ bool FullFunctionEmitter::emit_function(
     };
     /* load addr -> {dest reg, flush writeback (vs discard)} */
     std::map<uint32_t, std::pair<int, bool>> ldd_sites;
+    /* Load addrs whose dependent successor is an LWL/LWR merging into that
+     * same rt. LWL/LWR read their destination late enough to receive the
+     * forwarded result of an immediately preceding load, so hardware merges
+     * into the value the load just fetched -- they are NOT subject to the
+     * load delay. The merge base must therefore name psx_ldd_<addr>, and the
+     * ordinary writeback is suppressed because the merge already consumed it.
+     * Without this the load was deferred AND then discarded (the successor
+     * writes rt), so the fetched word vanished and the merge combined the
+     * stale pre-load register -- silently wrong code. Mirrors the CFG
+     * emitter's set_lwlr_merge_forward path. */
+    std::set<uint32_t> ldd_lwlr_forward;
+    std::string unmodeled_load_delay;
     for (const auto& [la, lw_raw] : addr_to_raw) {
         int dest = simple_load_dest(lw_raw);
         uint32_t lop = lw_raw >> 26;
@@ -515,10 +580,15 @@ bool FullFunctionEmitter::emit_function(
             if (f != addr_to_raw.end() && insn_reads_gpr(f->second, dep_reg)) dep = true;
             auto t = addr_to_raw.find(pb.target);
             if (pb.target && t != addr_to_raw.end() && insn_reads_gpr(t->second, dep_reg)) dep = true;
-            if (dep)
-                std::fprintf(stderr,
-                    "[load-delay] UNMODELED: load 0x%08X in delay slot with dependent successor (func 0x%08X)\n",
-                    la, func.entry_addr);
+            if (dep) {
+                unmodeled_load_delay = fmt::format(
+                    "load 0x{:08X} in a branch delay slot has a dependent successor", la);
+                if (out_interpreter_reason) {
+                    std::fprintf(stderr,
+                        "[load-delay] UNMODELED: load 0x%08X in delay slot with dependent successor (func 0x%08X)\n",
+                        la, func.entry_addr);
+                }
+            }
             continue;
         }
         auto nx = addr_to_raw.find(la + 4);
@@ -530,10 +600,15 @@ bool FullFunctionEmitter::emit_function(
             uint32_t nx_phys = (la + 4) & 0x1FFFFFFFu;
             if (nx_phys >= base_phys && nx_phys + 4 <= base_phys + rom.size()) {
                 uint32_t nx_raw = read_u32_le(rom, nx_phys - base_phys);
-                if (insn_reads_gpr(nx_raw, dep_reg))
-                    std::fprintf(stderr,
-                        "[load-delay] UNMODELED: dependent pair crosses fragment boundary after load 0x%08X rt=%d (func 0x%08X)\n",
-                        la, dep_reg, func.entry_addr);
+                if (insn_reads_gpr(nx_raw, dep_reg)) {
+                    unmodeled_load_delay = fmt::format(
+                        "dependent load pair crosses a fragment boundary after 0x{:08X}", la);
+                    if (out_interpreter_reason) {
+                        std::fprintf(stderr,
+                            "[load-delay] UNMODELED: dependent pair crosses fragment boundary after load 0x%08X rt=%d (func 0x%08X)\n",
+                            la, dep_reg, func.entry_addr);
+                    }
+                }
             }
             continue;
         }
@@ -546,21 +621,82 @@ bool FullFunctionEmitter::emit_function(
             uint32_t nop_ = nx->second >> 26, nrt = (nx->second >> 16) & 31;
             bool complementary = (nrt == (uint32_t)dep_reg) &&
                                  ((lop == 0x22 && nop_ == 0x26) || (lop == 0x26 && nop_ == 0x22));
-            if (!complementary)
-                std::fprintf(stderr,
-                    "[load-delay] UNMODELED: LWL/LWR 0x%08X with dependent successor (func 0x%08X)\n",
-                    la, func.entry_addr);
+            if (!complementary) {
+                unmodeled_load_delay = fmt::format(
+                    "LWL/LWR 0x{:08X} has a dependent non-complementary successor", la);
+                if (out_interpreter_reason) {
+                    std::fprintf(stderr,
+                        "[load-delay] UNMODELED: LWL/LWR 0x%08X with dependent successor (func 0x%08X)\n",
+                        la, func.entry_addr);
+                }
+            }
             continue;
         }
         if (block_leaders.count(la + 4)) {
-            std::fprintf(stderr,
-                "[load-delay] UNMODELED: dependent pair split by label at 0x%08X (func 0x%08X)\n",
-                la + 4, func.entry_addr);
+            unmodeled_load_delay = fmt::format(
+                "dependent load pair is split by a label at 0x{:08X}", la + 4);
+            if (out_interpreter_reason) {
+                std::fprintf(stderr,
+                    "[load-delay] UNMODELED: dependent pair split by label at 0x%08X (func 0x%08X)\n",
+                    la + 4, func.entry_addr);
+            }
             continue;
+        }
+        {
+            const uint32_t nop_ = nx->second >> 26;
+            const uint32_t nrt_ = (nx->second >> 16) & 31u;
+            if ((nop_ == 0x22u || nop_ == 0x26u) &&
+                nrt_ == static_cast<uint32_t>(dep_reg)) {
+                ldd_lwlr_forward.insert(la);
+                ldd_sites[la] = {dest, false};
+                continue;
+            }
         }
         ldd_sites[la] = {dest, true};
     }
+    if (!unmodeled_load_delay.empty()) {
+        // dirty_ram_dispatch interprets live main-RAM bytes only. Relocated
+        // kernel/shell functions satisfy that contract; a pure ROM function
+        // does not. Never turn a correctness fallback into a later
+        // unknown-dispatch abort: stop generation if there is no interpreter
+        // backend capable of executing every instruction in this function.
+        const bool ram_backed = std::all_of(
+            addr_to_raw.begin(), addr_to_raw.end(),
+            [](const auto& insn) {
+                return (bios_runtime_pc(insn.first) & 0x1FFFFFFFu) <
+                       (2u * 1024u * 1024u);
+            });
+        if (!ram_backed) {
+            throw std::runtime_error(fmt::format(
+                "cannot safely emit BIOS function 0x{:08X}: {}; "
+                "the function is not RAM-backed, so interpreter fallback is unavailable",
+                func.entry_addr, unmodeled_load_delay));
+        }
+        if (out_interpreter_reason) {
+            *out_interpreter_reason = unmodeled_load_delay;
+            std::fprintf(stderr,
+                "[load-delay] FALLBACK: function 0x%08X excluded from native dispatch; using interpreter (%s)\n",
+                func.entry_addr, unmodeled_load_delay.c_str());
+        }
+        return false;
+    }
+
+    // Shadow 'out' with a reference to 'body' so all existing out+= lines
+    // write to the temporary buffer.  The real 'out' is assembled at the end.
+    std::string& func_out = body;
+    #define out func_out
+
     for (auto& [la, s] : ldd_sites) {
+        if (ldd_lwlr_forward.count(la)) {
+            /* The LWL/LWR merge consumes the temp; no writeback and no
+               discard. Do NOT let the successor-writes-rt rule below turn
+               this into a discard. */
+            std::fprintf(stderr,
+                "[load-delay] modeled pair: load 0x%08X rt=%d succ 0x%08X "
+                "LWL/LWR-forward (func 0x%08X)\n",
+                la, s.first, la + 4, func.entry_addr);
+            continue;
+        }
         uint32_t nw = addr_to_raw.at(la + 4);
         if (insn_writes_gpr(nw, static_cast<uint32_t>(s.first))) {
             auto nsite = ldd_sites.find(la + 4);
@@ -623,6 +759,12 @@ bool FullFunctionEmitter::emit_function(
     auto emit_ldd_flush = [&](uint32_t succ_addr) {
         auto it = ldd_sites.find(succ_addr - 4);
         if (it == ldd_sites.end()) return;
+        if (ldd_lwlr_forward.count(it->first)) {
+            out += fmt::format(
+                "    /* psx_ldd_{:08X} forwarded into the LWL/LWR merge above */\n",
+                it->first);
+            return;
+        }
         if (it->second.second) {
             out += fmt::format("    cpu->gpr[{}] = psx_ldd_{:08X};  /* load-delay writeback */\n",
                                it->second.first, it->first);
@@ -647,22 +789,132 @@ bool FullFunctionEmitter::emit_function(
 
     // I-cache FETCH cost (faithful R3000A), emitted BEFORE the per-instruction
     // interlock/load — like Beetle ReadInstruction precedes the base, so a fetch MISS
-    // clears any pending load give-back before the next load arms one. Only emitted at
-    // cache-line LEADERS: a block leader (any branch/dispatch entry — a possibly-cold
-    // cache entry; cross-function targets are inserted into block_leaders above) OR a
-    // 16-byte-line start (addr&0xC==0, a sequential line crossing). Intra-line followers
-    // reached by fall-through are guaranteed hits (the leader refilled the line to its
-    // end) → no call (+0). `rom_addr` is the ROM/compile-time address; relocate_ra maps
-    // it to the RUNTIME guest PC the CPU actually fetches from (BIOS main stays in-place
-    // KSEG1 0xBFC..; relocated kernel Part 2 → 0x500+, shell → 0x80030000+), so the
-    // shared I-cache evolves identically to the dirty-RAM interp (cpu->pc) and Beetle —
-    // and the KSEG1 uncached test (>=0xA0000000) sees the true virtual address. The
-    // relocation preserves bits[3:0], so the line-leader test is space-independent.
+    // clears any pending load give-back before the next load arms one. `rom_addr` is
+    // the ROM/compile-time address; relocate_ra maps it to the RUNTIME guest PC the CPU
+    // actually fetches from (BIOS main stays in-place KSEG1 0xBFC..; relocated kernel
+    // Part 2 → 0x500+, shell → 0x80030000+), so the shared I-cache evolves identically
+    // to the dirty-RAM interp (cpu->pc) and Beetle.
+    //  - CACHED runtime PC: emitted only at cache-line LEADERS: a block leader (any
+    //    branch/dispatch entry — a possibly-cold cache entry; cross-function targets
+    //    are inserted into block_leaders above) OR a 16-byte-line start of the RUNTIME
+    //    PC (pc&0xC==0, a sequential line crossing). Intra-line followers reached by
+    //    fall-through are guaranteed hits (the leader refilled the line to its end) →
+    //    no call (+0). The line test must use the runtime PC: a copy window need not
+    //    preserve bits[3:0]. OpenBIOS copies its kernel from ROM 0x1FC1E4D4 to RAM
+    //    0x500, so a ROM-address test put every line crossing of the kernel one
+    //    instruction early (a hit) and left the real crossing uncharged.
+    //  - UNCACHED runtime PC (psx_fetch_uncached: the ROM run in place at KSEG1): no
+    //    fetch ever fills a line, so there is no follower to elide. Every instruction
+    //    pays +4 and clears the load give-back, exactly as the interpreter (a fetch at
+    //    every cpu->pc) and Beetle charge it. Emitting only at leaders left 5,477 of
+    //    OpenBIOS's 9,592 KSEG1 instruction sites 4 cycles short.
     auto emit_icache_fetch = [&](uint32_t rom_addr) {
         if (!per_insn_cycles) return;
-        if (!(block_leaders.count(rom_addr) || (rom_addr & 0xCu) == 0)) return;
+        const uint32_t pc = relocate_ra(rom_addr);
+        if (!psx_fetch_uncached(pc) &&
+            !(block_leaders.count(rom_addr) || (pc & 0xCu) == 0)) return;
         out += fmt::format("#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_icache_fetch(cpu, 0x{:08X}u);\n#endif\n",
-                           relocate_ra(rom_addr));
+                           pc);
+    };
+
+    auto emit_patch_range_guard = [&](uint32_t addr) {
+        // Kernel patch-range hook (CLAUDE.md Rule 18 / docs/dynamic_handler_install.md).
+        // The BIOS and the game's Psy-Q libapi patchers overwrite specific
+        // kernel-RAM words at runtime: install stubs written over ROM zeros
+        // (RAM 0xCF0, the SIO data-byte handler), but also a `jr` planted over
+        // real ROM instructions, an 11-word prologue rewrite that inserts an
+        // `mfc0 Cause`, and a driver routine NOP'd out. The recompiler emitted
+        // the ROM bytes; if we run those statically the guest's patch never
+        // executes.
+        //
+        // At every possible entry into a declared range, emit a runtime check: if ANY word
+        // in the range differs from its ROM-baked value, the patch is live —
+        // dispatch into RAM so the interpreter runs the guest's own
+        // instructions (Rule 18: we execute the patch as written, we do not
+        // synthesise its effect). The rest of the body still runs native,
+        // because the range is also published to the runtime, which excludes
+        // it from the kernel-bless memcmp (memory.c) and hands straight-line
+        // flow back at the range end (dirty_ram_interp.c).
+        //
+        // Ranges come from the profile's [[recompiler.install_slots]]; see
+        // docs/dynamic_handler_install.md for how to find new ones.
+        uint32_t ram_pc = addr_model().rom_to_ram_phys(addr);
+        const BiosInstallSlot* slot = nullptr;
+        for (const auto& range : addr_model().install_slots()) {
+            if (ram_pc >= range.ram_addr && ram_pc < range.hi()) { slot = &range; break; }
+        }
+        if (slot) {
+            /* Where the compiled body picks up again:
+             *  - Jalr (legacy 4-word stub): the stub's jalr captures
+             *    ra = stub_PC + 8 = ram_addr + 0x10, so the called function
+             *    returns there.
+             *  - Fallthrough: the patched words ARE the function; execution
+             *    continues at the end of the range.
+             *  - None: the patch is a `jr` out of the kernel and never comes
+             *    back to this body.
+             * For the first two, register the resume PC as both a block leader
+             * (so label_<resume>: exists) and a local continuation (so the
+             * entry-switch and the emitted continuation wrapper route to it).
+             * Without the continuation key, external dispatch to the resume PC
+             * misses and falls into interpretation, which has no COP0 and
+             * crashes the exception handler. */
+            uint32_t resume_ram = slot->resume_addr();
+            if (resume_ram != 0u) {
+                uint32_t resume_rom = addr + (resume_ram - ram_pc);
+                if (addr_to_raw.count(resume_rom)) {
+                    block_leaders.insert(resume_rom);
+                    uint32_t resume_norm = normalize_address(resume_rom);
+                    if (!all_function_entries_norm.count(resume_norm)) {
+                        local_continuations.push_back({resume_rom, cont_key(resume_rom, resume_norm), norm});
+                    }
+                }
+            }
+            /* Compare every word in the range against the ROM-baked value.
+             * The old test was `first word != 0`, which only fires for a stub
+             * written over ROM zeros — a `jr` planted over a real instruction
+             * and a prologue rewrite both leave non-zero ROM words and were
+             * never detected. A page-level dirty bit is far too coarse: the
+             * kernel handler dirties page 0 on every exception by saving
+             * registers, which would redirect unconditionally. Word-level
+             * compare is exact: the range is "live" iff the guest has actually
+             * changed it. */
+            std::string cond;
+            uint32_t base_phys_local = base_addr & 0x1FFFFFFFu;
+            for (uint32_t off = 0; off < slot->len; off += 4u) {
+                uint32_t w_rom_addr = addr - (ram_pc - slot->ram_addr) + off;
+                uint32_t w_phys = w_rom_addr & 0x1FFFFFFFu;
+                if (w_phys < base_phys_local ||
+                    w_phys + 4u > base_phys_local + rom.size()) {
+                    throw std::runtime_error(fmt::format(
+                        "install slot RAM 0x{:08X} len 0x{:X}: word +0x{:X} "
+                        "lies outside the ROM image", ram_pc, slot->len, off));
+                }
+                uint32_t rom_word = read_u32_le(rom, w_phys - base_phys_local);
+                if (!cond.empty()) cond += " ||\n        ";
+                cond += fmt::format("cpu->read_word(0x{:08X}u) != 0x{:08X}u",
+                                    slot->ram_addr + off, rom_word);
+            }
+            // A normal delay-slot execution belongs to the guarded branch.
+            // A direct branch TO this label has no pending branch flag.
+            auto pending = pending_at.find(addr);
+            if (pending != pending_at.end())
+                cond = fmt::format("!psx_delay_{:08X} && ({})",
+                                   pending->second.terminator_addr, cond);
+            out += fmt::format(
+                "    /* 0x{:08X}: kernel patch-range hook (RAM [0x{:08X},0x{:08X}),\n"
+                "     * resume RAM 0x{:08X}). If the guest has overwritten any word\n"
+                "     * of this range, dispatch into RAM so its own instructions run;\n"
+                "     * otherwise fall through to the statically compiled ROM code. */\n"
+                "    if ({}) {{\n"
+                "#ifdef PSX_ENABLE_BLOCK_CYCLES\n"
+                "        psx_cyc_bb_defer_flush();\n"
+                "#endif\n"
+                "        psx_check_interrupts_at(cpu, 0x{:08X}u);\n"
+                "        cpu->pc = 0x{:08X}u; return;\n"
+                "    }}\n",
+                addr, slot->ram_addr, slot->hi(), resume_ram,
+                cond, ram_pc, ram_pc);
+        }
     };
 
     for (auto it = addr_to_raw.begin(); it != addr_to_raw.end(); ++it) {
@@ -674,6 +926,7 @@ bool FullFunctionEmitter::emit_function(
         // can service vblank and other hardware interrupts.
         if (block_leaders.count(addr)) {
             out += fmt::format("label_{:08X}:\n", addr);
+            emit_patch_range_guard(addr);
             // Per-block-leader cycle observe (cyc_watch ruler). Sampled BEFORE
             // this block's cycle advance, so it reports cumulative cycles for
             // all PRIOR blocks — matching Beetle's before-instruction sample
@@ -701,7 +954,7 @@ bool FullFunctionEmitter::emit_function(
                 if (bcit != block_cycles.end()) bcyc = bcit->second;
                 if (bcyc > 0) {
                     out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
-                    out += fmt::format("    psx_advance_cycles({}u);\n", bcyc);
+                    out += fmt::format("    psx_cpu_charge({}u);\n", bcyc);
                     out += "#endif\n";
                 }
             }
@@ -721,7 +974,9 @@ bool FullFunctionEmitter::emit_function(
 
         // Decode and translate.
         PSXRecomp::DecodedInstruction d = PSXRecomp::MipsDecoder::decode(raw, addr);
-        TranslateResult tr = StrictTranslator::translate(d);
+        // Runtime PC for the PCs the translation hands the runtime (store-PC
+        // stamp, syscall EPC, break/unaligned diagnostics), §5.2.
+        TranslateResult tr = StrictTranslator::translate(d, relocate_ra(addr));
 
         if (!tr.supported) {
             out += fmt::format("    /* UNSUPPORTED 0x{:08X}: {:08X} {} */\n",
@@ -862,7 +1117,7 @@ bool FullFunctionEmitter::emit_function(
                             uint32_t ds_offset = ds_phys - base_phys;
                             uint32_t ds_raw = read_u32_le(rom, ds_offset);
                             auto ds_d = PSXRecomp::MipsDecoder::decode(ds_raw, ds_addr);
-                            auto ds_tr = StrictTranslator::translate(ds_d);
+                            auto ds_tr = StrictTranslator::translate(ds_d, relocate_ra(ds_addr));
                             if (ds_tr.supported && !ds_tr.is_terminator) {
                                 out += fmt::format("    /* DELAY (orphaned) 0x{:08X}: {:08X}  {} */\n",
                                                    ds_addr, ds_raw, ds_tr.comment);
@@ -904,7 +1159,7 @@ bool FullFunctionEmitter::emit_function(
                         uint32_t ds_offset = ds_phys - base_phys;
                         uint32_t ds_raw = read_u32_le(rom, ds_offset);
                         auto ds_d = PSXRecomp::MipsDecoder::decode(ds_raw, ds_addr);
-                        auto ds_tr = StrictTranslator::translate(ds_d);
+                        auto ds_tr = StrictTranslator::translate(ds_d, relocate_ra(ds_addr));
                         if (ds_tr.supported && !ds_tr.is_terminator) {
                             out += fmt::format("    /* DELAY (orphaned) 0x{:08X}: {:08X}  {} */\n",
                                                ds_addr, ds_raw, ds_tr.comment);
@@ -973,7 +1228,7 @@ bool FullFunctionEmitter::emit_function(
                         uint32_t ds_offset = ds_phys - base_phys;
                         uint32_t ds_raw = read_u32_le(rom, ds_offset);
                         auto ds_d = PSXRecomp::MipsDecoder::decode(ds_raw, ds_addr);
-                        auto ds_tr = StrictTranslator::translate(ds_d);
+                        auto ds_tr = StrictTranslator::translate(ds_d, relocate_ra(ds_addr));
                         if (ds_tr.supported && !ds_tr.is_terminator) {
                             out += fmt::format("    /* DELAY (orphaned) 0x{:08X}: {:08X}  {} */\n",
                                                ds_addr, ds_raw, ds_tr.comment);
@@ -1003,7 +1258,7 @@ bool FullFunctionEmitter::emit_function(
                         uint32_t ds_offset = ds_phys - base_phys;
                         uint32_t ds_raw = read_u32_le(rom, ds_offset);
                         auto ds_d = PSXRecomp::MipsDecoder::decode(ds_raw, ds_addr);
-                        auto ds_tr = StrictTranslator::translate(ds_d);
+                        auto ds_tr = StrictTranslator::translate(ds_d, relocate_ra(ds_addr));
                         if (ds_tr.supported && !ds_tr.is_terminator) {
                             out += fmt::format("    /* DELAY (orphaned) 0x{:08X}: {:08X}  {} */\n",
                                                ds_addr, ds_raw, ds_tr.comment);
@@ -1020,7 +1275,7 @@ bool FullFunctionEmitter::emit_function(
                         if (addr_to_raw.count(addr + 8)) {
                             uint32_t cn = normalize_address(addr + 8);
                             if (!all_function_entries_norm.count(cn))
-                                local_continuations.push_back({addr + 8, cn, norm});
+                                local_continuations.push_back({addr + 8, cont_key(addr + 8, cn), norm});
                         } else {
                             register_cross_function_target(addr + 8);
                         }
@@ -1060,7 +1315,7 @@ bool FullFunctionEmitter::emit_function(
                         uint32_t ds_offset = ds_phys - base_phys;
                         uint32_t ds_raw = read_u32_le(rom, ds_offset);
                         auto ds_d = PSXRecomp::MipsDecoder::decode(ds_raw, ds_addr);
-                        auto ds_tr = StrictTranslator::translate(ds_d);
+                        auto ds_tr = StrictTranslator::translate(ds_d, relocate_ra(ds_addr));
                         if (ds_tr.supported && !ds_tr.is_terminator) {
                             out += fmt::format("    /* DELAY (orphaned) 0x{:08X}: {:08X}  {} */\n",
                                                ds_addr, ds_raw, ds_tr.comment);
@@ -1076,7 +1331,7 @@ bool FullFunctionEmitter::emit_function(
                         if (addr_to_raw.count(addr + 8)) {
                             uint32_t cn = normalize_address(addr + 8);
                             if (!all_function_entries_norm.count(cn))
-                                local_continuations.push_back({addr + 8, cn, norm});
+                                local_continuations.push_back({addr + 8, cont_key(addr + 8, cn), norm});
                         } else {
                             register_cross_function_target(addr + 8);
                         }
@@ -1103,57 +1358,6 @@ bool FullFunctionEmitter::emit_function(
             continue;
         }
 
-        // Install-slot hook (CLAUDE.md Rule 18 / docs/dynamic_handler_install.md).
-        // The PS1 BIOS overwrites specific kernel-RAM addresses at runtime
-        // with dispatch stubs (e.g. RAM 0xCF0 for the SIO data-byte handler).
-        // The recompiler emitted NOPs from the ROM image; if we just run those
-        // statically, the installed stub never executes.  At known install-slot
-        // PCs, emit a runtime check: if the page is dirty (RAM was written-to),
-        // dispatch into RAM to run the installed code.  Otherwise fall through
-        // to the static NOP.
-        //
-        // Install slots come from the profile's [[recompiler.install_slots]]
-        // (e.g. SCPH1001's SIO data-byte handler slot at RAM 0xCF0). See
-        // docs/dynamic_handler_install.md for how to find new ones.
-        uint32_t ram_pc = addr_model().rom_to_ram_phys(addr);
-        bool is_install_slot = addr_model().is_install_slot(ram_pc);
-        if (is_install_slot) {
-            /* The installed stub is 4 instructions: lui, addiu, jalr, nop.
-             * The jalr captures ra = stub_PC + 8 = install_slot + 0x10.  When
-             * the stub's called function returns via jr ra, control flows back
-             * to install_slot + 0x10.  Register that ROM address as both a
-             * block leader (so label_<post_stub>: is emitted) and a local
-             * continuation (so the entry-switch routes to it).  Without this,
-             * external dispatch to the post-stub PC misses and falls into
-             * interpretation, which doesn't have COP0 and crashes the
-             * exception handler. */
-            uint32_t post_stub_rom = addr + 0x10u;
-            if (addr_to_raw.count(post_stub_rom)) {
-                block_leaders.insert(post_stub_rom);
-                uint32_t post_stub_norm = normalize_address(post_stub_rom);
-                if (!all_function_entries_norm.count(post_stub_norm)) {
-                    local_continuations.push_back({post_stub_rom, post_stub_norm, norm});
-                }
-            }
-            /* Hook fires only when the FIRST instruction word at this PC
-             * differs from the ROM-baked value (= 0x00000000 NOP for these
-             * slots).  A page-level dirty bit is too coarse: the kernel
-             * handler dirties page 0 on every exception by saving registers,
-             * which would unconditionally redirect into the interpreter.
-             * Word-level check is exact: the slot is "live" iff the BIOS
-             * install function has actually overwritten it. */
-            out += fmt::format(
-                "    /* 0x{:08X}: install-slot hook (RAM 0x{:08X}) — if the BIOS\n"
-                "     * has overwritten this slot with an install stub, dispatch\n"
-                "     * into the stub.  Otherwise fall through to static NOP.\n"
-                "     * After the stub's jalr returns, ra=RAM 0x{:08X} routes\n"
-                "     * back here as a registered continuation target. */\n"
-                "    if (cpu->read_word(0x{:08X}u) != 0u) {{\n"
-                "        psx_check_interrupts_at(cpu, 0x{:08X}u);\n"
-                "        cpu->pc = 0x{:08X}u; return;\n"
-                "    }}\n",
-                addr, ram_pc, ram_pc + 0x10u, ram_pc, ram_pc, ram_pc);
-        }
 
         // Non-terminator: emit normally — unless this load's successor reads
         // its destination (MIPS-I load-delay pair): then defer the register
@@ -1163,6 +1367,30 @@ bool FullFunctionEmitter::emit_function(
             out += fmt::format("    /* load-delay pair: gpr[{}] writeback deferred past 0x{:08X} */\n",
                                ldd_sites[addr].first, addr + 4);
             out += fmt::format("    {}\n", tr.c_code_deferred);
+        } else if (ldd_lwlr_forward.count(addr - 4u)) {
+            /* This LWL/LWR consumes the pending load from addr-4: point its
+             * merge base at the deferred temp. strict_translator emits that
+             * base as a single psx_old_rt initializer reading the GPR, which
+             * still holds the PRE-load value here. If that emitted shape ever
+             * changes, fail the build rather than silently emit a stale merge. */
+            const int fwd_rt = ldd_sites.at(addr - 4u).first;
+            const std::string from =
+                fmt::format("uint32_t psx_old_rt      = cpu->gpr[{}];", fwd_rt);
+            const std::string to =
+                fmt::format("uint32_t psx_old_rt      = psx_ldd_{:08X};", addr - 4u);
+            std::string fwd = tr.c_code;
+            const size_t at = fwd.find(from);
+            if (at == std::string::npos) {
+                throw std::runtime_error(fmt::format(
+                    "cannot forward pending load 0x{:08X} into the LWL/LWR at "
+                    "0x{:08X} (func 0x{:08X}): merge-base initializer not found",
+                    addr - 4u, addr, func.entry_addr));
+            }
+            fwd.replace(at, from.size(), to);
+            out += fmt::format(
+                "    /* LWL/LWR merge takes the forwarded psx_ldd_{:08X} */\n",
+                addr - 4u);
+            out += fmt::format("    {}\n", fwd);
         } else {
             out += fmt::format("    {}\n", tr.c_code);
         }
@@ -1225,7 +1453,7 @@ bool FullFunctionEmitter::emit_function(
                     uint32_t cont_rom = pb.terminator_addr + 8;
                     uint32_t cont_norm = normalize_address(cont_rom);
                     if (!all_function_entries_norm.count(cont_norm)) {
-                        local_continuations.push_back({cont_rom, cont_norm, norm});
+                        local_continuations.push_back({cont_rom, cont_key(cont_rom, cont_norm), norm});
                     }
                 } else if (cps) {
                     register_cross_function_target(pb.terminator_addr + 8);
@@ -1271,7 +1499,7 @@ bool FullFunctionEmitter::emit_function(
                     uint32_t cont_rom = pb.terminator_addr + 8;
                     uint32_t cont_norm = normalize_address(cont_rom);
                     if (!all_function_entries_norm.count(cont_norm)) {
-                        local_continuations.push_back({cont_rom, cont_norm, norm});
+                        local_continuations.push_back({cont_rom, cont_key(cont_rom, cont_norm), norm});
                     }
                 } else if (cps) {
                     register_cross_function_target(pb.terminator_addr + 8);
@@ -1397,7 +1625,11 @@ bool FullFunctionEmitter::emit_function(
                                 if (!seen_runtime.insert(rv).second) continue;
                                 uint32_t rom_target = ram_alias_to_rom(rv);
                                 register_cross_function_target(rom_target);
-                                if (addr_to_raw.count(rom_target) && block_leaders.count(rom_target))
+                                // A variant continues locally only for a case
+                                // value in its own segment; another segment's
+                                // value is dispatched with its full PC (§5.4).
+                                if (addr_to_raw.count(rom_target) && block_leaders.count(rom_target) &&
+                                    (!variant || rv == bios_runtime_pc(rom_target)))
                                     targets.push_back({rv, rom_target});
                             }
                             if (!targets.empty()) {
@@ -1436,7 +1668,7 @@ bool FullFunctionEmitter::emit_function(
         uint32_t last_addr = addr_to_raw.rbegin()->first;
         uint32_t last_raw  = addr_to_raw.rbegin()->second;
         PSXRecomp::DecodedInstruction last_d = PSXRecomp::MipsDecoder::decode(last_raw, last_addr);
-        TranslateResult last_tr = StrictTranslator::translate(last_d);
+        TranslateResult last_tr = StrictTranslator::translate(last_d, relocate_ra(last_addr));
 
         // If the last instruction is a delay slot with a pending branch,
         // check whether it fully handles control flow.  Unconditional control
@@ -1455,9 +1687,12 @@ bool FullFunctionEmitter::emit_function(
         }
         if (!has_control_flow) {
             // Fallthrough tail call: set cpu->pc and return; dispatch loop re-dispatches.
+            // Publish the RUNTIME PC, like every other transfer here (a
+            // relocated window runs at its RAM address; §5.2).
             uint32_t next_addr = last_addr + 4;
             out += emit_irq_check(next_addr);
-            out += fmt::format("    cpu->pc = 0x{:08X}u; return;  /* fallthrough */\n", next_addr);
+            out += fmt::format("    cpu->pc = 0x{:08X}u; return;  /* fallthrough */\n",
+                               relocate_ra(next_addr));
         }
     }
 
@@ -1539,7 +1774,8 @@ void FullFunctionEmitter::emit_dispatch(
     const std::vector<uint8_t>&         rom,
     uint32_t                            base_addr,
     const std::vector<BiosVectorTable>& bios_vectors,
-    const std::vector<BiosAlias>&       bios_aliases)
+    const std::vector<BiosAlias>&       bios_aliases,
+    const std::vector<std::pair<uint32_t, std::string>>& variant_rows)
 {
     // RECURSION_BUG.md §25 — continuation-passing. Under CPS the BIOS A0/B0/C0
     // vector dispatch must TAIL-TRANSFER to the handler (set cpu->pc, return)
@@ -1577,6 +1813,7 @@ void FullFunctionEmitter::emit_dispatch(
     // backend ABI come from the runtime headers rather than being
     // re-declared here, so they cannot drift from what the runtime reads.
     out += "#include \"psx_bios_backend.h\"\n";
+    out += "#include \"psx_segment_miss.h\"\n";
     out += "#include <stdint.h>\n";
     out += "#include <stdio.h>\n";
     out += "#include <stdlib.h>\n\n";
@@ -1600,6 +1837,8 @@ void FullFunctionEmitter::emit_dispatch(
     out += " * NULL (the default) = pure LLE, dispatch identical to a build without\n";
     out += " * the tier. */\n";
     out += "extern int (*g_psx_bios_hle_hook)(CPUState* cpu, uint32_t phys);\n\n";
+    out += "extern uint32_t g_psx_mod_guest_functions;\n";
+    out += "extern int psx_mod_dispatch_guest_function(CPUState*, uint32_t);\n\n";
     out += "#ifdef PSX_HAS_GAME_DISPATCH\n";
     out += "extern int psx_game_address_in_text(uint32_t addr);\n";
     out += "#endif\n\n";
@@ -1614,6 +1853,10 @@ void FullFunctionEmitter::emit_dispatch(
         } else {
             out += fmt::format("extern void {}(CPUState* cpu);\n", fn_sym(norm));
         }
+    }
+    for (const auto& [pc, sym] : variant_rows) {
+        (void)pc;
+        out += fmt::format("extern void {}(CPUState* cpu);\n", sym);
     }
     out += "\n";
 
@@ -1745,6 +1988,18 @@ void FullFunctionEmitter::emit_dispatch(
     }
     out += "};\n\n";
 
+    // Segment variants (docs/SEGMENT_AWARE_CODE.md §5.4): bodies compiled for
+    // one exact runtime PC in another segment than their window's. Keyed by
+    // the full PC; the normalized table above still finds the word (and its
+    // kernel-bless guard applies), then an exact match runs the variant.
+    if (!variant_rows.empty()) {
+        out += fmt::format("static const DispatchEntry segment_variant_table[{}] = {{\n",
+                           variant_rows.size());
+        for (const auto& [pc, sym] : variant_rows)
+            out += fmt::format("    {{ 0x{:08X}u, {} }},\n", pc, sym);
+        out += "};\n\n";
+    }
+
     // --- Kernel body-extent table (runtime kernel-image bless) ---
     // The BIOS copies Kernel Part 2 from ROM [0x1FC10000,0x1FC18000) to RAM
     // [0x500,0x8500) at boot; the functions above with keys in that window
@@ -1792,8 +2047,45 @@ void FullFunctionEmitter::emit_dispatch(
                            g_sym_prefix, kb_count);
         out += kb;
         out += "};\n";
-        out += fmt::format("static const uint32_t {}psx_bios_kernel_body_count = {}u;\n\n",
+        // An enum is an integer constant expression in C. A const-qualified
+        // object is not, so MSVC rejects it in the file-scope backend
+        // initializer even though GCC and Clang accept it as an extension.
+        out += fmt::format("enum {{ {}psx_bios_kernel_body_count = {}u }};\n\n",
                            g_sym_prefix, kb_count);
+    }
+
+    // --- Kernel patch-range table (runtime bless + interp hand-back) ---
+    // The profile's [[recompiler.install_slots]], couriered verbatim to the
+    // runtime. Two consumers read it: memory.c verifies a kernel body in
+    // segments that SKIP these ranges (so a body with a live install stub is
+    // still blessed for native execution — before this, the whole-body memcmp
+    // failed forever on the first patch and the BIOS exception handler
+    // interpreted for the life of the process), and dirty_ram_interp.c hands
+    // straight-line flow back to static dispatch at a range's hi, which the
+    // per-function emitter registered as a continuation key. The guest's
+    // patched words themselves still execute on the interpreter, as written.
+    //
+    // Emitted sorted and non-overlapping (BiosAddressModel::from_config
+    // validates and sorts), because the runtime's verifier walks them in
+    // order.
+    {
+        std::string pr;
+        size_t pr_count = 0;
+        for (const BiosInstallSlot& sl : addr_model().install_slots()) {
+            pr += fmt::format("    {{ 0x{:08X}u, 0x{:08X}u }},\n",
+                              sl.ram_addr, sl.hi());
+            pr_count++;
+        }
+        out += fmt::format(
+            "static const PsxKernelPatchRange {}psx_bios_kernel_patch_ranges[{}] = {{\n",
+            g_sym_prefix, pr_count ? pr_count : 1);
+        // A zero-length array is not C; an image with no declared slots emits
+        // one inert entry and a count of 0, which every consumer range-tests
+        // against the count before indexing.
+        out += pr_count ? pr : "    { 0u, 0u },\n";
+        out += "};\n";
+        out += fmt::format("enum {{ {}psx_bios_kernel_patch_range_count = {}u }};\n\n",
+                           g_sym_prefix, pr_count);
     }
 
     // --- Image self-description (runtime/include/psx_bios_image.h) ---
@@ -1834,11 +2126,21 @@ void FullFunctionEmitter::emit_dispatch(
             rom.size(), crc, wsum, bios_sha256, id, bundled);
     }
     // --- Runtime-installed BIOS call-vector stubs ---
-    // Every retail PSX BIOS installs the A0/B0/C0 ABI gates as the same
-    // four-instruction shape: lui/addiu $t0,target; jr $t0; nop. The target is
-    // BIOS-specific, so decode it from live RAM and require the complete shape
-    // before taking the native tail transfer. A game/BIOS patch that changes
-    // even one word fails closed to dirty_ram_interp below.
+    // Every PSX BIOS installs the A0/B0/C0 ABI gates as a 16-byte stub that
+    // loads the handler address into $t0 and jumps through it. Two shapes are
+    // in the wild:
+    //   A (retail SCPH-xxxx): lui $t0,hi; addiu $t0,$t0,lo; jr $t0; nop
+    //   B (OpenBIOS):         addiu $t0,$zero,lo; jr $t0; nop; nop
+    // The target is BIOS-specific, so decode it from live RAM and require one
+    // complete shape before taking the native tail transfer. A game/BIOS patch
+    // that changes even one word fails closed to dirty_ram_interp below. The
+    // cycle steps charge exactly the instructions the guest executes on that
+    // shape (shape B's fourth word is never reached: the jr's delay slot is
+    // word 2). Each executed word gets its own fetch, in Beetle order (fetch,
+    // then the step), because `addr` keeps the caller's segment: at KUSEG/KSEG0
+    // the first fetch fills the line and the rest are +0 hits, while a KSEG1
+    // call (e.g. `jalr 0xA00000A0`) pays +4 and a give-back clear per word,
+    // as the interpreter does.
     out += fmt::format("static const PsxNativeStub {}psx_bios_native_stubs[3] = {{\n",
                        g_sym_prefix);
     out += "    { 0x000000A0u, 0x000000A0u, 0x000000B0u },\n";
@@ -1847,6 +2149,12 @@ void FullFunctionEmitter::emit_dispatch(
     out += "};\n";
     out += fmt::format("static const uint32_t {}psx_bios_native_stub_count = 3u;\n\n",
                        g_sym_prefix);
+    auto emit_stub_insn = [&](uint32_t offset, uint32_t word) {
+        out += offset ? fmt::format("        psx_icache_fetch(cpu, addr + {}u);\n", offset)
+                      : std::string("        psx_icache_fetch(cpu, addr);\n");
+        out += fmt::format("        psx_cyc_step(cpu, 0x{:X}u);\n",
+                           psx_cyc_dep_res_mask(word));
+    };
     out += "static int psx_bios_try_native_call_stub(CPUState* cpu, "
            "uint32_t addr) {\n";
     out += "    uint32_t phys = addr & 0x1FFFFFFFu;\n";
@@ -1855,23 +2163,33 @@ void FullFunctionEmitter::emit_dispatch(
     out += "    uint32_t w1 = cpu->read_word(phys + 4u);\n";
     out += "    uint32_t w2 = cpu->read_word(phys + 8u);\n";
     out += "    uint32_t w3 = cpu->read_word(phys + 12u);\n";
-    out += "    if ((w0 & 0xFFFF0000u) != 0x3C080000u ||\n";
-    out += "        (w1 & 0xFFFF0000u) != 0x25080000u ||\n";
-    out += "        w2 != 0x01000008u || w3 != 0u) return 0;\n";
+    out += "    uint32_t target;\n";
+    out += "    if ((w0 & 0xFFFF0000u) == 0x3C080000u &&\n";
+    out += "        (w1 & 0xFFFF0000u) == 0x25080000u &&\n";
+    out += "        w2 == 0x01000008u && w3 == 0u) {\n";
+    out += "        /* shape A: lui $t0,hi; addiu $t0,$t0,lo; jr $t0; nop */\n";
+    out += "        target = ((w0 & 0xFFFFu) << 16) +\n";
+    out += "                 (uint32_t)(int32_t)(int16_t)(w1 & 0xFFFFu);\n";
     out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
-    out += "    psx_icache_fetch(cpu, addr);\n";
-    out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
-                       psx_cyc_dep_res_mask(0x3C080000u));
-    out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
-                       psx_cyc_dep_res_mask(0x25080000u));
-    out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
-                       psx_cyc_dep_res_mask(0x01000008u));
-    out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
-                       psx_cyc_dep_res_mask(0x00000000u));
+    emit_stub_insn(0u, 0x3C080000u);
+    emit_stub_insn(4u, 0x25080000u);
+    emit_stub_insn(8u, 0x01000008u);
+    emit_stub_insn(12u, 0x00000000u);
     out += "#endif\n";
-    out += "    cpu->gpr[8] = ((w0 & 0xFFFFu) << 16) +\n";
-    out += "                  (uint32_t)(int32_t)(int16_t)(w1 & 0xFFFFu);\n";
-    out += "    cpu->pc = cpu->gpr[8];\n";
+    out += "    } else if ((w0 & 0xFFFF0000u) == 0x24080000u &&\n";
+    out += "               w1 == 0x01000008u && w2 == 0u && w3 == 0u) {\n";
+    out += "        /* shape B: addiu $t0,$zero,lo; jr $t0; nop; nop */\n";
+    out += "        target = (uint32_t)(int32_t)(int16_t)(w0 & 0xFFFFu);\n";
+    out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
+    emit_stub_insn(0u, 0x24080000u);
+    emit_stub_insn(4u, 0x01000008u);
+    emit_stub_insn(8u, 0x00000000u);
+    out += "#endif\n";
+    out += "    } else {\n";
+    out += "        return 0;\n";
+    out += "    }\n";
+    out += "    cpu->gpr[8] = target;\n";
+    out += "    cpu->pc = target;\n";
     out += "    return 1;\n";
     out += "}\n\n";
 
@@ -1880,6 +2198,38 @@ void FullFunctionEmitter::emit_dispatch(
     // C can never drift from the analysis that produced it.
     out += addr_model().emit_normalize_c();
 
+    // The body a normalized hit runs (docs/SEGMENT_AWARE_CODE.md §5.4). The
+    // table is keyed by the normalized address, so it finds a word in any
+    // segment. A segment variant compiled for the exact PC runs instead of the
+    // word's home body. Any other PC in another segment than the home body's
+    // still runs the home body, which bakes its own segment's links, EPCs,
+    // fetch tags and store PCs: that is a BIOS segment miss, recorded in the
+    // segment-miss ring (kind BIOS) so the entry is loud and can be seeded.
+    out += addr_model().emit_key_home_pc_c(base_addr);
+    out += "extern uint64_t s_frame_count;\n";
+    out += "static PsxRecompFunc psx_bios_hit_body(CPUState* cpu, uint32_t addr, uint32_t key,\n";
+    out += "                                       PsxRecompFunc home) {\n";
+    if (!variant_rows.empty()) {
+        out += "    /* A segment variant compiled for this exact PC. */\n";
+        out += fmt::format("    for (int lo_ = 0, hi_ = {} - 1; lo_ <= hi_;) {{\n",
+                           variant_rows.size());
+        out += "        const int mid_ = (lo_ + hi_) / 2;\n";
+        out += "        if (segment_variant_table[mid_].addr == addr)\n";
+        out += "            return segment_variant_table[mid_].func;\n";
+        out += "        if (segment_variant_table[mid_].addr < addr) lo_ = mid_ + 1;\n";
+        out += "        else hi_ = mid_ - 1;\n";
+        out += "    }\n";
+    }
+    out += "    {\n";
+    out += "        const uint32_t home_pc = psx_bios_key_home_pc(key);\n";
+    out += "        if (home_pc != 0u && ((addr ^ home_pc) & 0xE0000000u) != 0u)\n";
+    out += "            psx_segment_miss_record_kind(addr, home_pc, cpu->gpr[31], cpu->gpr[29],\n";
+    out += "                                         (uint32_t)s_frame_count,\n";
+    out += "                                         PSX_SEGMENT_MISS_BIOS);\n";
+    out += "    }\n";
+    out += "    return home;\n";
+    out += "}\n\n";
+
     out += "extern int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr);\n";
     out += "extern int dirty_ram_is_dirty(uint32_t phys);\n";
     out += "extern int psx_kernel_bless_dispatchable(uint32_t phys);\n";
@@ -1887,10 +2237,13 @@ void FullFunctionEmitter::emit_dispatch(
     out += "extern uint64_t g_dispatch_static_hits;\n";
     out += "\n";
     out += "extern int g_psx_dispatch_depth;  /* runtime-owned: shared dispatch state, not per-image */\n\n";
+    // Return PCs are compared in full, segment included, as psx_call_contract
+    // does (docs/SEGMENT_AWARE_CODE.md §5.5): stop_addr is the link the call
+    // wrote, in its body's segment.
     out += "static void psx_dispatch_check_return_boundary(CPUState* cpu, uint32_t stop_addr) {\n";
     out += "    if (stop_addr != 0u) {\n";
     out += "        psx_check_interrupts_at(cpu, stop_addr);\n";
-    out += "        if (((cpu->pc ^ stop_addr) & 0x1FFFFFFFu) == 0) cpu->pc = 0;\n";
+    out += "        if (cpu->pc == stop_addr) cpu->pc = 0;\n";
     out += "    } else {\n";
     out += "        psx_check_interrupts(cpu);\n";
     out += "    }\n";
@@ -1914,6 +2267,8 @@ void FullFunctionEmitter::emit_dispatch(
     out += "        cpu->pc = 0;\n";
     out += fmt::format("        int lo = 0, hi = {} - 1;\n", total_entries);
     out += "        int found = 0;\n";
+    out += "        if (g_psx_mod_guest_functions)\n";
+    out += "            found = psx_mod_dispatch_guest_function(cpu, addr);\n";
     out += "        /* BIOS HLE tier: consult the hook FIRST, on the pre-normalize\n";
     out += "         * physical address. It must see (a) the A0/B0/C0 service vectors\n";
     out += "         * (game thunks jr there with the function number in $t1) and (b)\n";
@@ -1922,7 +2277,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "         * backends. Handled (rc 1) \xE2\x87\x92 the service completed against guest\n";
     out += "         * state and the guest resumes at $ra via the trampoline's normal\n";
     out += "         * return/tail contract below. rc 0 \xE2\x87\x92 pure LLE fall-through. */\n";
-        out += "        if (g_psx_bios_hle_hook &&\n";
+        out += "        if (!found && g_psx_bios_hle_hook &&\n";
         out += "            g_psx_bios_hle_hook(cpu, addr & 0x1FFFFFFFu)) {\n";
         out += "            cpu->pc = cpu->gpr[31];\n";
         out += "            found = 1;\n";
@@ -2016,7 +2371,9 @@ void FullFunctionEmitter::emit_dispatch(
     }
     out += "                g_debug_current_func_addr = phys;\n";
     out += "                debug_server_trace_dispatch(phys);\n";
-    out += "                dispatch_table[mid].func(cpu);\n";
+    // The exact PC picks the body: a segment variant, or the home body
+    // (recorded when the PC is in another segment than it, §5.4).
+    out += "                psx_bios_hit_body(cpu, addr, phys, dispatch_table[mid].func)(cpu);\n";
     out += "                g_dispatch_static_hits++;\n";
     out += "                found = 1;\n";
     out += "                break;\n";
@@ -2050,7 +2407,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "             * holds the guest's true target.  Resolve here iff the\n";
     out += "             * wild flow arrived exactly at this call's contract. */\n";
     out += "            if (stop_addr != 0 &&\n";
-    out += "                ((cpu->pc ^ stop_addr) & 0x1FFFFFFFu) == 0 &&\n";
+    out += "                cpu->pc == stop_addr &&\n";
     out += "                cpu->gpr[29] == sp_at_call) {\n";
     out += "                g_psx_call_bail = 0;\n";
     out += "                g_psx_bail_resolved++;\n";
@@ -2075,7 +2432,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "        if (cpu->pc == 0) {\n";
     out += "            if (stop_addr != 0 &&\n";
     out += "                (cpu->gpr[29] != sp_at_call ||\n";
-    out += "                 ((cpu->gpr[31] ^ stop_addr) & 0x1FFFFFFFu) != 0)) {\n";
+    out += "                 cpu->gpr[31] != stop_addr)) {\n";
     out += "                /* Callee C-returned but the guest did not return to\n";
     out += "                 * this call site ($ra holds the wild jr's target):\n";
     out += "                 * begin the bail unwind instead of resuming the\n";
@@ -2099,7 +2456,25 @@ void FullFunctionEmitter::emit_dispatch(
     out += "            return;\n";
     out += "        }\n";
     out += "        if (stop_addr != 0 && cpu->pc == stop_addr) {\n";
-    out += "            if (cpu->gpr[29] != sp_at_call) {\n";
+    out += "            /* An IRQ taken at a polled call's return boundary swaps sp\n";
+    out += "             * to/from the kernel exception/scratchpad stack, so a\n";
+    out += "             * LEGITIMATE return ($ra == stop_addr) can arrive with sp\n";
+    out += "             * differing from sp_at_call in EITHER direction (born on the\n";
+    out += "             * task stack / returning on the exception stack, and vice\n";
+    out += "             * versa). The strict gate misread that as recursion and\n";
+    out += "             * re-dispatched the same delivery forever until the depth\n";
+    out += "             * guard tripped (MoH, MoH Underground, Driver 2 mission\n";
+    out += "             * freezes). Recognize the straddle ONLY when $ra matches and\n";
+    out += "             * exactly one side is on the exception stack; recursion\n";
+    out += "             * (different $ra) and same-stack wild arrivals keep the\n";
+    out += "             * strict gate (Tomba Bug D unaffected). */\n";
+    out += "            uint32_t sp0_ = sp_at_call, sp1_ = cpu->gpr[29];\n";
+    out += "            int sp0_exc_ = ((uint32_t)(sp0_ - 0x1F800000u) < 0x400u);\n";
+    out += "            int sp1_exc_ = ((uint32_t)(sp1_ - 0x1F800000u) < 0x400u);\n";
+    out += "            int exc_sp_straddle_ =\n";
+    out += "                (cpu->gpr[31] == stop_addr) &&\n";
+    out += "                (sp0_exc_ != sp1_exc_);\n";
+    out += "            if (cpu->gpr[29] != sp_at_call && !exc_sp_straddle_) {\n";
     out += "                /* Same address, different frame (recursion or a wild\n";
     out += "                 * arrival): not this call's return — keep executing\n";
     out += "                 * via tail dispatch (interior alias route). */\n";
@@ -2127,6 +2502,10 @@ void FullFunctionEmitter::emit_dispatch(
         // RECURSION_BUG.md §25 — mark CPS mode at startup for runtime code that
         // routes CPS continuations (overlay_loader.c).
         out += "\n/* CPS runtime-mode marker (the overlay loader reads g_psx_cps_mode). */\n";
+        out += "/* Not in a loadable BIOS module (psx_bios_module.h): the host that\n";
+        out += " * loads one already runs in CPS mode, and a constructor firing at\n";
+        out += " * dlopen would write a runtime global the module cannot reach. */\n";
+        out += "#ifndef PSX_BIOS_MODULE_BUILD\n";
         out += "static void psx_cps_mark_bios(void) {\n";
         out += "    extern int g_psx_cps_mode; g_psx_cps_mode = 1;\n";
         out += "}\n";
@@ -2138,6 +2517,7 @@ void FullFunctionEmitter::emit_dispatch(
         out += "#else\n";
         out += "__attribute__((constructor)) static void psx_cps_mark_bios_ctor(void) { psx_cps_mark_bios(); }\n";
         out += "#endif\n";
+        out += "#endif /* !PSX_BIOS_MODULE_BUILD */\n";
     }
 
     // --- Backend descriptor (runtime/include/psx_bios_backend.h) ---
@@ -2154,6 +2534,8 @@ void FullFunctionEmitter::emit_dispatch(
         "    {0}psx_dispatch_call," "\n"
         "    {0}psx_bios_kernel_bodies," "\n"
         "    {0}psx_bios_kernel_body_count," "\n"
+        "    {0}psx_bios_kernel_patch_ranges," "\n"
+        "    {0}psx_bios_kernel_patch_range_count," "\n"
         "}};" "\n",
         g_sym_prefix);
 }
@@ -2171,9 +2553,21 @@ EmitStats FullFunctionEmitter::emit(
     const std::string&                out_dir,
     const std::string&                out_stem,
     const std::vector<BiosVectorTable>& bios_vectors,
-    const std::vector<BiosAlias>&       bios_aliases)
+    const std::vector<BiosAlias>&       bios_aliases,
+    const std::vector<BiosSegmentVariantSeed>& variant_seeds)
 {
     EmitStats stats;
+    g_variant_seg = kNoVariant;
+
+    // Setup / Retro zips omit generated/; create it before ofstream.
+    if (!out_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(out_dir, ec);
+        if (ec) {
+            throw std::runtime_error(
+                fmt::format("cannot create out_dir {}: {}", out_dir, ec.message()));
+        }
+    }
 
     // Namespace every symbol this emitter defines under the image's stem, so
     // two recompiled BIOSes can coexist in one binary (see g_sym_prefix).
@@ -2250,7 +2644,7 @@ EmitStats FullFunctionEmitter::emit(
     full_c += " * Compile generated code with -DPSX_ENABLE_BLOCK_CYCLES=1 to\n";
     full_c += " * activate cycle advancement at every block leader. */\n";
     full_c += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
-    full_c += "extern void psx_advance_cycles(uint32_t cycles);\n";
+    full_c += "extern void psx_cpu_charge(uint32_t cycles);\n";
     full_c += "#endif\n\n";
 
     // Forward declare ALL functions so intra-file calls resolve.
@@ -2264,19 +2658,20 @@ EmitStats FullFunctionEmitter::emit(
 
     // ---- PASS 1: dry run to collect cross-function tail-call targets ----
     std::map<uint32_t, std::set<uint32_t>> cross_targets_by_parent;
+    /* Instruction-address -> owning function (normalized). Hard caps
+     * partition the address space, so each walked instruction has exactly
+     * one owner. Used below to route cross-function targets to the
+     * function that actually CONTAINS them: the range-based parent guess
+     * (largest entry <= target) is wrong when seeds split a function into
+     * fragments and the preceding fragment ends before the target —
+     * emit_function's injection then silently dropped the continuation
+     * and the runtime FAIL-FASTed on dispatch (OpenBIOS exceptionHandler
+     * priority_loop 0xBFC208E8, split by the patch-slot code_ptr seeds).
+     * The segment-variant closure below uses it too. */
+    std::map<uint32_t, uint32_t> insn_owner;
     {
         std::vector<ContinuationLabel> dry_run_continuations;
         std::vector<ContinuationLabel> dry_run_cross;
-        /* Instruction-address -> owning function (normalized). Hard caps
-         * partition the address space, so each walked instruction has exactly
-         * one owner. Used below to route cross-function targets to the
-         * function that actually CONTAINS them: the range-based parent guess
-         * (largest entry <= target) is wrong when seeds split a function into
-         * fragments and the preceding fragment ends before the target —
-         * emit_function's injection then silently dropped the continuation
-         * and the runtime FAIL-FASTed on dispatch (OpenBIOS exceptionHandler
-         * priority_loop 0xBFC208E8, split by the patch-slot code_ptr seeds). */
-        std::map<uint32_t, uint32_t> insn_owner;
         for (const auto& fn : dr.functions) {
             std::string lineage = fn.discovered_by;
             uint32_t cap = hard_caps.count(fn.entry_addr)
@@ -2291,7 +2686,7 @@ EmitStats FullFunctionEmitter::emit(
             std::string tmp;
             std::set<uint32_t> empty;
             (void)emit_function(tmp, fn, sfr, all_function_entries_norm, rom, base_addr, rom_end,
-                                dry_run_continuations, empty, dry_run_cross);
+                                dry_run_continuations, empty, dry_run_cross, nullptr);
         }
         for (const auto& cl : dry_run_cross) {
             auto ow = insn_owner.find(cl.rom_addr);
@@ -2337,9 +2732,15 @@ EmitStats FullFunctionEmitter::emit(
         }
 
         std::vector<ContinuationLabel> discard_cross;  /* PASS 2 cross is unused */
+        std::string interpreter_reason;
         bool ok = emit_function(full_c, fn, sfr, all_function_entries_norm, rom, base_addr, rom_end,
-                                all_continuations, injected, discard_cross);
+                                all_continuations, injected, discard_cross, &interpreter_reason);
         if (!ok) {
+            if (!interpreter_reason.empty()) {
+                stats.interpreted.emplace_back(fn.entry_addr, interpreter_reason);
+                stats.functions_interpreted++;
+                continue;
+            }
             stats.skipped.emplace_back(fn.entry_addr, "emit_function failed");
             stats.functions_skipped++;
             continue;
@@ -2351,6 +2752,105 @@ EmitStats FullFunctionEmitter::emit(
     }
 
     stats.dispatch_entries = static_cast<uint32_t>(emitted_normalized.size());
+
+    // ---- Segment variants (docs/SEGMENT_AWARE_CODE.md §5.4) ----
+    // Each segment-qualified seed names a runtime PC in another segment than
+    // its copy window's. The function at its ROM bytes and that function's
+    // direct-edge closure (branch and J/JAL targets that leave it, the call
+    // return and fall-through past its end) are emitted again with the seed's
+    // segment. Dispatch runs a variant only for its exact PC.
+    std::vector<std::pair<uint32_t, std::string>> variant_rows;  // runtime PC -> symbol
+    std::vector<ContinuationLabel> variant_continuations;
+    if (!variant_seeds.empty()) {
+        std::map<uint32_t, uint32_t> norm_to_entry;
+        for (const auto& fn : dr.functions) norm_to_entry[fn.normalized_addr] = fn.entry_addr;
+        auto owner_entry = [&](uint32_t rom) -> uint32_t {
+            if (entry_to_idx.count(rom)) return rom;
+            auto ow = insn_owner.find(rom);
+            if (ow == insn_owner.end()) return 0;
+            auto e = norm_to_entry.find(ow->second);
+            return e == norm_to_entry.end() ? 0 : e->second;
+        };
+        std::map<uint32_t, std::set<uint32_t>> closure;  // segment -> ROM entries
+        for (const auto& vs : variant_seeds) {
+            if (!entry_to_idx.count(vs.rom) || !emitted_normalized.count(normalize_address(vs.rom))) {
+                throw std::runtime_error(fmt::format(
+                    "segment-variant seed 0x{:08X} ({}) names ROM 0x{:08X}, which is no "
+                    "emitted function entry (docs/SEGMENT_AWARE_CODE.md §5.4)",
+                    vs.pc, vs.label, vs.rom));
+            }
+            const uint32_t seg = vs.pc & 0xE0000000u;
+            std::vector<uint32_t> work{vs.rom};
+            while (!work.empty()) {
+                const uint32_t entry = work.back();
+                work.pop_back();
+                if (!closure[seg].insert(entry).second) continue;
+                const auto& fn = dr.functions[entry_to_idx.at(entry)];
+                uint32_t cap = hard_caps.count(fn.entry_addr) ? hard_caps[fn.entry_addr] : rom_end + 1;
+                auto sfr = FunctionDiscovery::walk_function(rom, base_addr, rom_end, fn.entry_addr,
+                                                            cap, fn.discovered_by);
+                std::set<uint32_t> own;
+                for (const auto& [a, w] : sfr.instructions) own.insert(a);
+                auto reach = [&](uint32_t target_rom) {
+                    if (own.count(target_rom)) return;
+                    const uint32_t e = owner_entry(target_rom);
+                    if (e && emitted_normalized.count(normalize_address(e))) work.push_back(e);
+                };
+                uint32_t last = 0, prev_raw = 0, last_raw = 0;
+                for (const auto& [a, w] : sfr.instructions) {
+                    const uint32_t op = w >> 26;
+                    if (op == 0x02 || op == 0x03) {  // j / jal: the runtime PC's top bits
+                        const uint32_t rt_src = addr_model().runtime_pc(a);
+                        const uint32_t t = ((rt_src + 4u) & 0xF0000000u) | ((w & 0x03FFFFFFu) << 2);
+                        const uint32_t t_phys = t & 0x1FFFFFFFu;
+                        reach(t_phys >= (base_addr & 0x1FFFFFFFu) &&
+                                      t_phys <= (rom_end & 0x1FFFFFFFu)
+                                  ? (base_addr & 0xE0000000u) | t_phys
+                                  : addr_model().ram_alias_to_rom(t));
+                    } else if (op == 0x01 || (op >= 0x04 && op <= 0x07)) {  // branches
+                        reach(a + 4u + (static_cast<uint32_t>(static_cast<int32_t>(
+                                            static_cast<int16_t>(w & 0xFFFFu))) << 2));
+                    }
+                    prev_raw = last_raw;
+                    last_raw = w;
+                    last = a;
+                }
+                // Past the end: a fall-through, or the return of a final call.
+                // Only an unconditional j / jr in the last pair ends the path.
+                auto ends = [](uint32_t w) {
+                    return (w >> 26) == 0x02 || ((w >> 26) == 0 && (w & 0x3F) == 0x08);
+                };
+                if (last && !ends(prev_raw) && !ends(last_raw)) reach(last + 4u);
+            }
+        }
+        for (const auto& [seg, entries] : closure) {
+            for (uint32_t entry : entries) {
+                const auto& fn = dr.functions[entry_to_idx.at(entry)];
+                uint32_t cap = hard_caps.count(fn.entry_addr) ? hard_caps[fn.entry_addr] : rom_end + 1;
+                auto sfr = FunctionDiscovery::walk_function(rom, base_addr, rom_end, fn.entry_addr,
+                                                            cap, fn.discovered_by);
+                if (!sfr.unsupported.empty()) continue;
+                std::set<uint32_t> injected;
+                if (cross_targets_by_parent.count(fn.normalized_addr))
+                    injected = cross_targets_by_parent[fn.normalized_addr];
+                std::vector<ContinuationLabel> discard_cross;
+                std::string interpreter_reason;
+                g_variant_seg = seg;
+                const uint32_t key = bios_runtime_pc(fn.entry_addr);
+                const bool ok = emit_function(full_c, fn, sfr, all_function_entries_norm, rom,
+                                              base_addr, rom_end, variant_continuations, injected,
+                                              discard_cross, &interpreter_reason);
+                g_variant_seg = kNoVariant;
+                if (!ok) {
+                    throw std::runtime_error(fmt::format(
+                        "segment variant 0x{:08X} of ROM 0x{:08X} could not be emitted "
+                        "though its home body was: {}", key, fn.entry_addr, interpreter_reason));
+                }
+                variant_rows.emplace_back(key, fn_sym(key));
+                stats.variant_functions++;
+            }
+        }
+    }
 
     // Emit fatal stubs for skipped functions (e.g. FPU) so calls to them
     // link but abort at runtime with a diagnostic.
@@ -2367,11 +2867,68 @@ EmitStats FullFunctionEmitter::emit(
     // --- Emit continuation wrappers ---
     // Deduplicate continuations by norm_addr (same label from multiple callers).
     std::map<uint32_t, ContinuationLabel> unique_continuations;
+    size_t slot_range_keys_dropped = 0;
     for (const auto& cl : all_continuations) {
+        // A PC inside a declared install-slot range must NOT become a native
+        // dispatch key. The compiled bytes there are not what executes — the
+        // guest's patch is — and the patch-range hook at the range start sets
+        // cpu->pc back to that same PC and returns, so dispatching into the
+        // body spins the dispatch loop forever. Dropping the key lets dispatch
+        // miss through to the dirty-RAM interpreter, which runs the guest's
+        // patched words: the intended path.
+        //
+        // Cost paid 2026-09-11: OpenBIOS RAM 0x357C already carried a
+        // jal-return continuation from before install slots existed, and
+        // declaring the card-handler range there wedged the boot at frame 0.
+        // Four more such keys sit inside retail's NOP'd pad-clear range.
+        if (addr_model().in_install_slot_range(cl.norm_addr)) {
+            slot_range_keys_dropped++;
+            continue;
+        }
         // Only add if not already a function entry (shouldn't be, but guard).
         if (!emitted_normalized.count(cl.norm_addr)) {
             unique_continuations[cl.norm_addr] = cl;
         }
+    }
+    if (slot_range_keys_dropped) {
+        std::fprintf(stdout,
+            "psxrecomp-bios: dropped %zu continuation key(s) inside declared install-slot ranges\n",
+            slot_range_keys_dropped);
+    }
+    // A FUNCTION ENTRY inside a declared range is a different matter: dropping
+    // it would silently remove a callable function from dispatch. That is a
+    // profile error (the range is too wide, or it covers real code the guest
+    // does not patch), so refuse to emit rather than produce a build whose
+    // dispatch quietly misses.
+    for (uint32_t norm : emitted_normalized) {
+        if (addr_model().in_install_slot_range(norm)) {
+            throw std::runtime_error(fmt::format(
+                "install-slot range covers the function entry at RAM 0x{:08X}: "
+                "a declared range may only cover words the guest patches, never "
+                "a dispatch entry. Narrow the range in the BIOS profile.", norm));
+        }
+    }
+
+    // A variant's continuations are keyed by their exact runtime PC and
+    // re-enter the variant body.
+    {
+        std::map<uint32_t, ContinuationLabel> unique_variant;
+        std::set<uint32_t> variant_keys;
+        for (const auto& [pc, sym] : variant_rows) variant_keys.insert(pc);
+        for (const auto& cl : variant_continuations) {
+            if (addr_model().in_install_slot_range(normalize_address(cl.rom_addr))) continue;
+            if (!variant_keys.count(cl.norm_addr)) unique_variant[cl.norm_addr] = cl;
+        }
+        for (const auto& [key, cl] : unique_variant) {
+            full_c += fmt::format("void {}(CPUState* cpu) {{\n",
+                                  cont_sym(cl.parent_func_norm, cl.rom_addr));
+            full_c += fmt::format("    cpu->pc = 0x{:08X}u;\n", cl.rom_addr);
+            full_c += fmt::format("    {}(cpu);\n", fn_sym(cl.parent_func_norm));
+            full_c += "}\n\n";
+            variant_rows.emplace_back(key, cont_sym(cl.parent_func_norm, cl.rom_addr));
+        }
+        std::sort(variant_rows.begin(), variant_rows.end());
+        stats.variant_entries = static_cast<uint32_t>(variant_rows.size());
     }
 
     if (!unique_continuations.empty()) {
@@ -2394,20 +2951,17 @@ EmitStats FullFunctionEmitter::emit(
     // Write <stem>_full.c
     {
         std::string path = out_dir + "/" + out_stem + "_full.c";
-        std::ofstream f(path, std::ios::binary);
-        if (!f) throw std::runtime_error(fmt::format("cannot write {}", path));
-        f.write(full_c.data(), static_cast<std::streamsize>(full_c.size()));
+        write_file_if_changed(path, full_c);
     }
 
     // Emit and write <stem>_dispatch.c
     {
         std::string dispatch_c;
         emit_dispatch(dispatch_c, dr, emitted_normalized, unique_continuations,
-                      bios_sha256, rom, base_addr, bios_vectors, bios_aliases);
+                      bios_sha256, rom, base_addr, bios_vectors, bios_aliases,
+                      variant_rows);
         std::string path = out_dir + "/" + out_stem + "_dispatch.c";
-        std::ofstream f(path, std::ios::binary);
-        if (!f) throw std::runtime_error(fmt::format("cannot write {}", path));
-        f.write(dispatch_c.data(), static_cast<std::streamsize>(dispatch_c.size()));
+        write_file_if_changed(path, dispatch_c);
     }
 
     // Write <stem>_skipped_functions.json. Stemmed like the C outputs: two
@@ -2423,9 +2977,24 @@ EmitStats FullFunctionEmitter::emit(
         }
         json += "]\n";
         std::string path = out_dir + "/" + out_stem + "_skipped_functions.json";
-        std::ofstream f(path, std::ios::binary);
-        if (!f) throw std::runtime_error(fmt::format("cannot write {}", path));
-        f.write(json.data(), static_cast<std::streamsize>(json.size()));
+        write_file_if_changed(path, json);
+    }
+
+    // Fail-closed functions are deliberately absent from native dispatch so
+    // the existing dispatch miss path executes their live bytes through the
+    // interpreter. Keep this separate from skipped_functions.json: skipped
+    // functions receive fatal diagnostic stubs, while these remain runnable.
+    if (!stats.interpreted.empty()) {
+        std::string json = "[\n";
+        for (size_t i = 0; i < stats.interpreted.size(); ++i) {
+            json += fmt::format("  {{\"address\": \"0x{:08X}\", \"reason\": \"{}\"}}",
+                                stats.interpreted[i].first, stats.interpreted[i].second);
+            if (i + 1 < stats.interpreted.size()) json += ",";
+            json += "\n";
+        }
+        json += "]\n";
+        std::string path = out_dir + "/" + out_stem + "_interpreted_functions.json";
+        write_file_if_changed(path, json);
     }
 
     return stats;

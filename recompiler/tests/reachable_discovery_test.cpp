@@ -102,9 +102,95 @@ bool resolves_ape_switch(const ApeSwitchFixture& f,
         nullptr, producer_lo, producer_hi);
 }
 
+ApeSwitchFixture make_scheduled_switch() {
+    auto f = make_ape_switch();
+    const size_t text = 2048;
+    put32(f.image, text + 0x500, 0);
+    put32(f.image, text + 0x504, 0);
+    put32(f.image, text + 0x508, 0x2C620003u); // sltiu v0,v1,3
+    put32(f.image, text + 0x50C, 0x1040001Cu); // beq v0,zero,+0x580
+    put32(f.image, text + 0x510, 0x3C028001u); // lui v0 (guard delay)
+    put32(f.image, text + 0x514, 0x24420A00u); // addiu v0,v0,0xa00
+    put32(f.image, text + 0x518, 0x00031880u); // sll v1,v1,2
+    put32(f.image, text + 0x51C, 0x00621821u); // addu v1,v1,v0
+    put32(f.image, text + 0x520, 0x8C620000u); // lw v0,0(v1)
+    return f;
+}
+
+void check_scheduled_switch() {
+    const size_t text = 2048;
+    auto f = make_scheduled_switch();
+    auto exe = parse(f.image);
+    PSXRecomp::ExactJumpTable table;
+    CHECK(PSXRecomp::resolve_exact_bounded_jump_table(
+              exe, f.entry, kLoad + 0x600u, f.jr_pc, 2u, table) &&
+          table.table_base == f.table && table.table_count == 3u,
+          "scheduled table constant resolves exactly");
+    std::set<uint32_t> targets;
+    for (auto target : table.targets) targets.insert(target.second);
+    CHECK(targets == std::set<uint32_t>(f.cases.begin(), f.cases.end()),
+          "scheduled table has exactly the expected case targets");
+    PSXRecomp::FunctionAnalyzer analyzer(exe);
+    auto result = analyzer.analyze_exact_entries({f.entry});
+    for (auto target : f.cases)
+        CHECK(result.exact_reachable_pcs.count(target),
+              "scheduled switch cases are reached from the function root");
+
+    auto renamed = f;
+    put32(renamed.image, text + 0x510, 0x3C088001u);
+    put32(renamed.image, text + 0x514, 0x25020A00u);
+    CHECK(resolves_ape_switch(renamed, renamed.entry),
+          "scheduled constant can rename registers");
+    auto no_load_delay = f;
+    no_load_delay.jr_pc = kLoad + 0x524u;
+    put32(no_load_delay.image, text + 0x524, 0x00400008u);
+    CHECK(!resolves_ape_switch(no_load_delay, f.entry),
+          "scheduled switch must respect the R3000 load delay");
+    auto signed_low = f;
+    signed_low.image.resize(text + 0x9000u);
+    put32(signed_low.image, 0x1C, 0x9000u);
+    put32(signed_low.image, text + 0x510, 0x3C028002u);
+    put32(signed_low.image, text + 0x514, 0x24428A00u);
+    for (size_t i = 0; i < f.cases.size(); ++i)
+        put32(signed_low.image, text + 0x8A00u + 4u * i, f.cases[i]);
+    CHECK(resolves_ape_switch(signed_low, f.entry, kLoad, kLoad + 0x9000u),
+          "scheduled constant sign-extends ADDIU low half");
+    CHECK(!resolves_ape_switch(f, f.entry, kLoad, kLoad + 0x900u),
+          "scheduled table must belong to the producer");
+
+    auto jump = [](uint32_t offset) {
+        return 0x08000000u | (((kLoad + offset) >> 2) & 0x03FFFFFFu);
+    };
+    const std::vector<std::vector<std::pair<size_t, uint32_t>>> mutations = {
+        {{0x508, 0x2C630003u}, {0x50C, 0x1060001Cu}}, // bound writes index
+        {{0x510, 0x3C038001u}, {0x514, 0x24620A00u}}, // LUI writes index
+        {{0x514, 0x24430A00u}}, // ADDIU writes index
+        {{0x514, 0x25020A00u}}, // wrong constant source
+        {{0x510, 0x3C228001u}}, // reserved LUI fields
+        {{0x50C, jump(0x580) | 0x04000000u}}, // JAL delay
+        {{0x50C, 0x5040001Cu}}, // BEQL
+        {{0x50C, 0x1040FFFFu}}, // self-loop with clobbered condition
+        {{0x50C, 0x10400000u}}, // reject into LUI
+        {{0x500, jump(0x510)}}, // earlier edge skips bound
+        {{0x590, jump(0x510)}}, // later edge skips bound
+        {{0x540, jump(0x510)}, {0x544, 0}}, // case skips bound
+        {{0x504, jump(0x580)}}, // bound in delay slot
+        {{0xA00, kLoad + 0x510u}}, // case target skips bound
+        {{0xA04, kLoad + 0x2000u}}, // out of host
+    };
+    for (const auto& changes : mutations) {
+        auto broken = f;
+        for (auto change : changes)
+            put32(broken.image, text + change.first, change.second);
+        CHECK(!resolves_ape_switch(broken, broken.entry),
+              "unsafe scheduled-switch mutation fails closed");
+    }
+}
+
 } // namespace
 
 int main() {
+    check_scheduled_switch();
     auto image = make_exe_buffer(0x2000);
     const size_t text = 2048;
 
@@ -701,6 +787,92 @@ int main() {
           "canonical generated final-page reservation remains compatible");
     CHECK(rounded.code_size() == 0x1800,
           "page reservation does not widen static analysis payload");
+
+    // Retail PS-X EXEs may declare BSS inside a sector-rounded payload. The
+    // overlap is safe only when every overlapped file byte is padding zero.
+    auto zero_padded_bss = make_exe_buffer(0x1000);
+    put32(zero_padded_bss, 0x28, kLoad + 0xDBC); // 0x244-byte overlap
+    put32(zero_padded_bss, 0x2C, 0x400);
+    std::string zero_bss_error;
+    const auto zero_bss_exe = PSXRecomp::PS1ExeParser::parse_buffer(
+        zero_padded_bss, zero_bss_error);
+    CHECK(zero_bss_exe.has_value(),
+          "zero-only BSS/payload overlap is accepted");
+
+    auto nonzero_bss = zero_padded_bss;
+    nonzero_bss[text + 0xE00] = 1;
+    std::string nonzero_bss_error;
+    const auto nonzero_bss_exe = PSXRecomp::PS1ExeParser::parse_buffer(
+        nonzero_bss, nonzero_bss_error);
+    CHECK(!nonzero_bss_exe.has_value(),
+          "non-zero BSS/code overlap remains rejected");
+    CHECK(nonzero_bss_error.find("overlaps non-zero code/data") !=
+              std::string::npos,
+          "non-zero overlap reports the unsafe bytes");
+
+    auto before_code_bss = zero_padded_bss;
+    put32(before_code_bss, 0x28, kLoad - 4);
+    std::string before_code_error;
+    CHECK(!PSXRecomp::PS1ExeParser::parse_buffer(
+               before_code_bss, before_code_error).has_value(),
+          "BSS beginning before the payload remains rejected");
+
+    // The KSEG0 main-RAM decode window is 8 MiB: an image placed in a retail
+    // mirror (a mod engine copied to 0x80780000) is valid, one crossing the
+    // window end is not.
+    auto mirror_image = make_exe_buffer(0x1000);
+    put32(mirror_image, 0x10, 0x80780000u);
+    put32(mirror_image, 0x18, 0x80780000u);
+    std::string mirror_error;
+    CHECK(PSXRecomp::PS1ExeParser::parse_buffer(mirror_image, mirror_error).has_value(),
+          "image in the 4th RAM mirror is accepted");
+    put32(mirror_image, 0x10, 0x807FF800u);
+    put32(mirror_image, 0x18, 0x807FF800u);
+    CHECK(!PSXRecomp::PS1ExeParser::parse_buffer(mirror_image, mirror_error).has_value() &&
+              mirror_error.find("beyond 0x80800000") != std::string::npos,
+          "image crossing the RAM decode window end is rejected");
+    // A KUSEG header names the same RAM as KSEG0 but keeps its segment: the
+    // program runs at KUSEG PCs, so it compiles there
+    // (docs/SEGMENT_AWARE_CODE.md §5.3).
+    put32(mirror_image, 0x10, 0x00780000u);
+    put32(mirror_image, 0x18, 0x00780000u);
+    {
+        auto kuseg = PSXRecomp::PS1ExeParser::parse_buffer(mirror_image, mirror_error);
+        CHECK(kuseg.has_value() && kuseg->load_address() == 0x00780000u &&
+                  kuseg->header.initial_pc == 0x00780000u &&
+                  kuseg->link_segment() == PSXRecomp::kSegKUSEG &&
+                  kuseg->phys_load_address() == 0x00780000u &&
+                  kuseg->contains_phys(0x80780FFCu) &&
+                  !kuseg->contains_phys(0x00781000u) &&
+                  kuseg->read_word(0x00780000u).has_value() &&
+                  !kuseg->read_word(0x80780000u).has_value(),
+              "a KUSEG header keeps its segment; bytes are addressed physically");
+    }
+    put32(mirror_image, 0x10, 0x007FF800u);
+    put32(mirror_image, 0x18, 0x007FF800u);
+    CHECK(!PSXRecomp::PS1ExeParser::parse_buffer(mirror_image, mirror_error).has_value() &&
+              mirror_error.find("beyond 0x00800000") != std::string::npos,
+          "a KUSEG image crossing its RAM window end is rejected");
+    // KSEG1 is accepted as an uncached home segment.
+    put32(mirror_image, 0x10, 0xA0010000u);
+    put32(mirror_image, 0x18, 0xA0010000u);
+    {
+        auto kseg1 = PSXRecomp::PS1ExeParser::parse_buffer(mirror_image, mirror_error);
+        CHECK(kseg1.has_value() && kseg1->link_segment() == PSXRecomp::kSegKSEG1,
+              "a KSEG1-linked header is accepted in its own segment");
+    }
+    // One image, one link segment.
+    put32(mirror_image, 0x10, 0x80010000u);
+    put32(mirror_image, 0x18, 0x00010000u);
+    CHECK(!PSXRecomp::PS1ExeParser::parse_buffer(mirror_image, mirror_error).has_value() &&
+              mirror_error.find("different segments") != std::string::npos,
+          "an entry in another segment than the load address is rejected");
+    // Outside main RAM (KSEG2, the BIOS ROM) is not a PS-X EXE target.
+    put32(mirror_image, 0x10, 0xBFC00000u);
+    put32(mirror_image, 0x18, 0xBFC00000u);
+    CHECK(!PSXRecomp::PS1ExeParser::parse_buffer(mirror_image, mirror_error).has_value() &&
+              mirror_error.find("Must be in main RAM") != std::string::npos,
+          "a load address outside the main-RAM windows is rejected");
 
     if (failures) {
         std::fprintf(stderr, "FAILED (%d)\n", failures);

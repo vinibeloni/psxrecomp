@@ -28,6 +28,7 @@
  */
 
 #include "gpu_sw_renderer.h"
+#include "gpu_vram_dirty.h"
 #include "gpu_sw_edges.h"
 #include <string.h>
 #include <stdlib.h>
@@ -98,6 +99,9 @@ static int g_raw_texture; /* 1 = skip modulation */
 
 /* Texture filtering: 0 = nearest (native PSX), 1 = bilinear. */
 static int g_texture_filter = 0;
+/* The player's filter request, applied unless faithful authority is on. */
+static int g_texture_filter_req = 0;
+static int g_faithful_authority = 0;   /* see sw_set_faithful_authority */
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
@@ -162,19 +166,21 @@ static inline RTarget rt_hires(void) {
  * into the OTHER buffer's band in the shared wide surface and corrupt it
  * (top/bottom edge flicker as the buffers flip). Canonical VRAM never showed
  * this because its draw-area clip already confines it. Scale matches SSAA. */
+static int view_enabled, view_shift, view_pad_left, view_pad_right;
 static inline RTarget rt_wide(void) {
     int s = g_scale;
     RTarget t;
     t.buf = g_wide_cur;
     t.w = g_wide_w * s; t.h = VRAM_HEIGHT * s; t.s = s;
-    t.cx1 = 0;             t.cy1 = g_clip_y1 * s;
-    t.cx2 = g_wide_w * s - 1; t.cy2 = g_clip_y2 * s + (s - 1);
+    t.cx1 = view_pad_left * s; t.cy1 = g_clip_y1 * s;
+    t.cx2 = (g_wide_w - view_pad_right) * s - 1;
+    t.cy2 = g_clip_y2 * s + (s - 1);
     return t;
 }
 
 /* X-translation (native px) from canonical VRAM space into the active wide
  * surface: local_x = vram_x - base_x + OFFSET. */
-static inline int wide_dx(void) { return g_wide_off - g_wide_cur_base; }
+static inline int wide_dx(void) { return g_wide_off + view_shift - g_wide_cur_base; }
 
 /* Native-wide 2D-backdrop X-stretch (SW renderer), mirroring the GL
  * wide_set_bd_scale exactly. The far 2D backdrop (sprite-tagged tile grid: sky
@@ -274,6 +280,9 @@ static inline void put_opaque(const RTarget *t, int x, int y, uint16_t color) {
     if (g_mask_set_bit) color |= 0x8000;
 
     t->buf[idx] = color;
+    /* Canonical VRAM only (hi-res / wide mirrors are present-side). */
+    if (t->buf == g_vram)
+        gpu_vram_dirty_mark_row((uint32_t)y);
 }
 
 /* Write a textured pixel — semi-trans only if texel bit 15 is set */
@@ -316,6 +325,8 @@ static inline void put_textured(const RTarget *t, int x, int y, uint16_t texel,
     if (g_mask_set_bit) color |= 0x8000;
 
     t->buf[idx] = color;
+    if (t->buf == g_vram)
+        gpu_vram_dirty_mark_row((uint32_t)y);
 }
 
 /* ------------------------------------------------------------------ */
@@ -402,6 +413,7 @@ static uint16_t texel_fetch_bilinear(float fu, float fv, uint16_t texpage,
     if (fy > 128) fy = 128;
 
     uint16_t c00 = bl_fetch(iu, iv, texpage, clut_x, clut_y);
+    if (c00 == 0) return 0x0000;
     uint16_t c10 = bl_fetch(iu + su, iv, texpage, clut_x, clut_y);
     uint16_t c01 = bl_fetch(iu, iv + sv, texpage, clut_x, clut_y);
     uint16_t c11 = bl_fetch(iu + su, iv + sv, texpage, clut_x, clut_y);
@@ -411,7 +423,6 @@ static uint16_t texel_fetch_bilinear(float fu, float fv, uint16_t texpage,
     int w01 = (c01 ? 1 : 0) * (256 - fx) * fy;
     int w11 = (c11 ? 1 : 0) * fx * fy;
     int opac = w00 + w10 + w01 + w11;
-    if (opac < 32768) return 0x0000;    /* opacity < 0.5: transparent */
 
     int r = ((c00 & 0x1F) * w00 + (c10 & 0x1F) * w10
            + (c01 & 0x1F) * w01 + (c11 & 0x1F) * w11) / opac;
@@ -425,6 +436,11 @@ static uint16_t texel_fetch_bilinear(float fu, float fv, uint16_t texpage,
     return (uint16_t)(r | (g << 5) | (b << 10) | (stp ? 0x8000 : 0));
 }
 
+static inline float bilinear_center_shift_for_target(const RTarget *t) {
+    int s = (t && t->s > 0) ? t->s : 1;
+    return 0.5f / (float)s - 1.0f / 64.0f;
+}
+
 /* uv sampling bounds (see g_uv_lim): the shared PS1 uv model in gpu_uv.h.
  * The software DDA truncates exactly like the PS1, so unlike the GL/VK
  * backends NO mirrored-2D compensation is applied here — these bounds only
@@ -433,7 +449,8 @@ static uint16_t texel_fetch_bilinear(float fu, float fv, uint16_t texpage,
 
 static void sw_tri_uv_limits(const int *xs, const int *ys,
                              const int *us, const int *vs) {
-    psx_uv_tri_limits(xs, ys, us, vs, g_uv_lim);
+    if (g_perspective_valid) psx_uv_tri_world_limits(us, vs, g_uv_lim);
+    else psx_uv_tri_limits(xs, ys, us, vs, g_uv_lim);
 }
 
 static void sw_rect_uv_limits(int u0, int v0, int u1, int v1) {
@@ -461,6 +478,13 @@ void sw_renderer_init(uint16_t *vram) {
     g_mod_r = g_mod_g = g_mod_b = 16; /* neutral = 128/8 = 16 (no modulation) */
     g_raw_texture = 0;
     g_texture_filter = 0;
+    g_texture_filter_req = 0;
+}
+
+/* Point the rasterizer at another VRAM array without touching any draw
+ * state (the OpenGL render thread switches its upload source this way). */
+void sw_renderer_rebind_vram(uint16_t *vram) {
+    g_vram = vram;
 }
 
 /* ------------------------------------------------------------------ */
@@ -495,11 +519,29 @@ void sw_renderer_set_scale(int scale) {
 
 int sw_renderer_scale(void) { return g_scale; }
 
+/* Faithful authority (netplay): while this rasterizer writes the guest's
+ * authoritative VRAM -- the netplay dual-raster SW@1x mirror or the netplay
+ * software GPU -- it draws exactly what hardware draws. The PGXP overrides and
+ * texture filtering are presentation enhancements; here they would put host-
+ * only state (PGXP shadows, which a rollback load drops on one peer only, and
+ * each player's Display filter) into pixels the game can read back with GP0
+ * C0 (V8:2 samples its own frame), forking guest RAM between peers. */
+void sw_set_faithful_authority(int on) {
+    g_faithful_authority = on ? 1 : 0;
+    g_texture_filter = g_faithful_authority ? 0 : g_texture_filter_req;
+    if (g_faithful_authority) {
+        g_precise_valid = 0;
+        g_perspective_valid = 0;
+    }
+}
+
+int sw_faithful_authority(void) { return g_faithful_authority; }
+
 void sw_set_precise_triangle(int enabled,
                              int32_t x0, int32_t y0,
                              int32_t x1, int32_t y1,
                              int32_t x2, int32_t y2) {
-    g_precise_valid = enabled ? 1 : 0;
+    g_precise_valid = (enabled && !g_faithful_authority) ? 1 : 0;
     g_precise_x16[0] = x0; g_precise_y16[0] = y0;
     g_precise_x16[1] = x1; g_precise_y16[1] = y1;
     g_precise_x16[2] = x2; g_precise_y16[2] = y2;
@@ -507,11 +549,14 @@ void sw_set_precise_triangle(int enabled,
 
 void sw_set_perspective_triangle(int enabled,
                                  float q0, float q1, float q2) {
-    g_perspective_valid = enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f;
+    const int requested = enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f;
+    g_perspective_valid = requested && !g_faithful_authority;
     g_perspective_q[0] = q0;
     g_perspective_q[1] = q1;
     g_perspective_q[2] = q2;
-    if (g_perspective_valid) g_perspective_triangles++;
+    /* Counts requests: under faithful authority the GPU presentation surface
+     * still draws them perspective-correct. */
+    if (requested) g_perspective_triangles++;
 }
 
 uint32_t sw_perspective_triangle_count(void) {
@@ -538,7 +583,10 @@ static inline void precise_consumed(void) {
     g_perspective_valid = 0;
 }
 
-void sw_set_texture_filter(int bilinear) { g_texture_filter = bilinear ? 1 : 0; }
+void sw_set_texture_filter(int bilinear) {
+    g_texture_filter_req = bilinear ? 1 : 0;
+    g_texture_filter = g_faithful_authority ? 0 : g_texture_filter_req;
+}
 int  sw_texture_filter(void) { return g_texture_filter; }
 
 /* ------------------------------------------------------------------ */
@@ -626,6 +674,7 @@ void sw_fill_rect(int x, int y, int w, int h, uint16_t color) {
             g_vram[py * VRAM_WIDTH + px] = color;
         }
     }
+    gpu_vram_dirty_mark_rect(x0, y0, w, h);
 
     if (g_hr) hr_fill_block(x, y, w, h, color);
 }
@@ -691,6 +740,7 @@ void sw_copy_rect(int src_x, int src_y, int dst_x, int dst_y, int w, int h) {
                 }
             }
         }
+        gpu_vram_dirty_mark_row((uint32_t)dy);
     }
 
     if (hr_rows) free(hr_rows);
@@ -974,10 +1024,16 @@ static void raster_textured_triangle(const RTarget *t,
                 }
             }
 
-            uint16_t texel = g_texture_filter
-                ? texel_fetch_bilinear(fu, fv, texpage, clut_x, clut_y)
-                : texel_fetch((int)fu & 0xFF, (int)fv & 0xFF, texpage, clut_x, clut_y);
-            put_textured(t, x, y, texel, g_mod_r, g_mod_g, g_mod_b, g_raw_texture);
+            if (g_texture_filter) {
+                float sh = bilinear_center_shift_for_target(t);
+                uint16_t texel = texel_fetch_bilinear(fu + sh, fv + sh,
+                                                      texpage, clut_x, clut_y);
+                put_textured(t, x, y, texel, g_mod_r, g_mod_g, g_mod_b, g_raw_texture);
+            } else {
+                uint16_t texel = texel_fetch((int)fu & 0xFF, (int)fv & 0xFF,
+                                             texpage, clut_x, clut_y);
+                put_textured(t, x, y, texel, g_mod_r, g_mod_g, g_mod_b, g_raw_texture);
+            }
         }
     }
 }
@@ -1153,10 +1209,16 @@ static void raster_shaded_textured_triangle(const RTarget *t,
             if (mg < 0) mg = 0; if (mg > 31) mg = 31;
             if (mb < 0) mb = 0; if (mb > 31) mb = 31;
 
-            uint16_t texel = g_texture_filter
-                ? texel_fetch_bilinear(fu, fv, texpage, clut_x, clut_y)
-                : texel_fetch((int)fu & 0xFF, (int)fv & 0xFF, texpage, clut_x, clut_y);
-            put_textured(t, x, y, texel, mr, mg, mb, raw_texture);
+            if (g_texture_filter) {
+                float sh = bilinear_center_shift_for_target(t);
+                uint16_t texel = texel_fetch_bilinear(fu + sh, fv + sh,
+                                                      texpage, clut_x, clut_y);
+                put_textured(t, x, y, texel, mr, mg, mb, raw_texture);
+            } else {
+                uint16_t texel = texel_fetch((int)fu & 0xFF, (int)fv & 0xFF,
+                                             texpage, clut_x, clut_y);
+                put_textured(t, x, y, texel, mr, mg, mb, raw_texture);
+            }
         }
     }
 }
@@ -1292,7 +1354,8 @@ static void raster_textured_rect(const RTarget *t, int x, int y, int w, int h,
             uint16_t texel;
             if (g_texture_filter) {
                 float fu = (float)u + (float)col / (float)s;
-                texel = texel_fetch_bilinear(fu, fv, texpage, clut_x, clut_y);
+                float sh = bilinear_center_shift_for_target(t);
+                texel = texel_fetch_bilinear(fu + sh, fv + sh, texpage, clut_x, clut_y);
             } else {
                 int tu = (u + col / s) & 0xFF;
                 texel = texel_fetch(tu, tv, texpage, clut_x, clut_y);
@@ -1383,7 +1446,8 @@ static void raster_textured_rect_scaled(const RTarget *t, int x, int y,
             uint16_t texel;
             if (g_texture_filter) {
                 float fu = (float)u0 + (float)du * (float)col / (float)w;
-                texel = texel_fetch_bilinear(fu, fv, texpage, clut_x, clut_y);
+                float sh = bilinear_center_shift_for_target(t);
+                texel = texel_fetch_bilinear(fu + sh, fv + sh, texpage, clut_x, clut_y);
             } else {
                 int tu = (int)(u0 + ((int64_t)du * col) / w) & 0xFF;
                 texel = texel_fetch(tu, tv, texpage, clut_x, clut_y);
@@ -1514,6 +1578,7 @@ void sw_vram_write(int x, int y, uint16_t pixel) {
     x &= (VRAM_WIDTH - 1);
     y &= (VRAM_HEIGHT - 1);
     g_vram[y * VRAM_WIDTH + x] = pixel;
+    gpu_vram_dirty_mark_row((uint32_t)y);
 
     if (g_hr) {
         int s = g_scale;
@@ -1533,7 +1598,71 @@ uint16_t sw_vram_read(int x, int y) {
 /* Bulk VRAM transfers                                                */
 /* ------------------------------------------------------------------ */
 
+/* Rebuild the supersampled mirror from canonical VRAM after a bulk replace.
+ * Row-wise replication (memcpy) beats the per-texel nested loop used by the
+ * general transfer path — savestate restore hits full 1024×512 often. */
+static void hr_rebuild_from_vram(void) {
+    if (!g_hr || !g_vram) return;
+    const int s = g_scale;
+    if (s <= 1) return;
+    uint16_t *row = (uint16_t *)malloc((size_t)g_hr_w * sizeof(uint16_t));
+    if (!row) {
+        /* Fall back to slow per-pixel replication if OOM (should not happen). */
+        for (int py = 0; py < VRAM_HEIGHT; py++) {
+            for (int px = 0; px < VRAM_WIDTH; px++) {
+                uint16_t pixel = g_vram[py * VRAM_WIDTH + px];
+                int bx = px * s, by = py * s;
+                for (int dy = 0; dy < s; dy++) {
+                    uint16_t *dst = g_hr + (size_t)(by + dy) * (size_t)g_hr_w;
+                    for (int dx = 0; dx < s; dx++)
+                        dst[bx + dx] = pixel;
+                }
+            }
+        }
+        return;
+    }
+    for (int y = 0; y < VRAM_HEIGHT; y++) {
+        const uint16_t *src = g_vram + (size_t)y * VRAM_WIDTH;
+        for (int x = 0; x < VRAM_WIDTH; x++) {
+            uint16_t p = src[x];
+            uint16_t *d = row + (size_t)x * (size_t)s;
+            for (int dx = 0; dx < s; dx++)
+                d[dx] = p;
+        }
+        for (int dy = 0; dy < s; dy++) {
+            memcpy(g_hr + ((size_t)(y * s + dy) * (size_t)g_hr_w),
+                   row, (size_t)g_hr_w * sizeof(uint16_t));
+        }
+    }
+    free(row);
+}
+
 void sw_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data) {
+    if (!data || !g_vram || w <= 0 || h <= 0) return;
+
+    /* Full-VRAM replace (savestate / boot_state): memcpy + one HR rebuild.
+     * The general path is a wrapped per-pixel loop that, with supersampling,
+     * does s² stores per guest texel — multi-second hitches on 2×/4×. */
+    if (x == 0 && y == 0 && w == VRAM_WIDTH && h == VRAM_HEIGHT) {
+        memcpy(g_vram, data, (size_t)VRAM_WIDTH * (size_t)VRAM_HEIGHT * sizeof(uint16_t));
+        gpu_vram_dirty_mark_all();
+        if (g_hr) hr_rebuild_from_vram();
+        return;
+    }
+
+    /* Contiguous non-wrapping rect, no HR: memcpy each row. */
+    x &= (VRAM_WIDTH - 1);
+    y &= (VRAM_HEIGHT - 1);
+    if (!g_hr && x + w <= VRAM_WIDTH && y + h <= VRAM_HEIGHT) {
+        for (int row = 0; row < h; row++) {
+            memcpy(g_vram + (size_t)(y + row) * VRAM_WIDTH + (size_t)x,
+                   data + (size_t)row * (size_t)w,
+                   (size_t)w * sizeof(uint16_t));
+        }
+        gpu_vram_dirty_mark_rect(x, y, w, h);
+        return;
+    }
+
     int idx = 0;
     int s = g_scale;
     for (int row = 0; row < h; row++) {
@@ -1552,10 +1681,29 @@ void sw_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data) {
                 }
             }
         }
+        gpu_vram_dirty_mark_row((uint32_t)py);
     }
 }
 
 void sw_vram_transfer_out(int x, int y, int w, int h, uint16_t *data) {
+    if (!data || !g_vram || w <= 0 || h <= 0) return;
+
+    if (x == 0 && y == 0 && w == VRAM_WIDTH && h == VRAM_HEIGHT) {
+        memcpy(data, g_vram, (size_t)VRAM_WIDTH * (size_t)VRAM_HEIGHT * sizeof(uint16_t));
+        return;
+    }
+
+    x &= (VRAM_WIDTH - 1);
+    y &= (VRAM_HEIGHT - 1);
+    if (x + w <= VRAM_WIDTH && y + h <= VRAM_HEIGHT) {
+        for (int row = 0; row < h; row++) {
+            memcpy(data + (size_t)row * (size_t)w,
+                   g_vram + (size_t)(y + row) * VRAM_WIDTH + (size_t)x,
+                   (size_t)w * sizeof(uint16_t));
+        }
+        return;
+    }
+
     int idx = 0;
     for (int row = 0; row < h; row++) {
         int py = (y + row) & (VRAM_HEIGHT - 1);
@@ -1657,6 +1805,16 @@ static uint16_t *wide_surf_for(int base_x) {
 
 /* Enable native-wide with a wide width + centering offset (native px), or
  * disable (wide_w <= 0). Re-allocates if the width changed. */
+void sw_wide_set_view(int enabled, int shift, int pad_left, int pad_right) {
+    if (!enabled) shift = pad_left = pad_right = 0;
+    if (view_enabled == enabled && view_shift == shift &&
+        view_pad_left == pad_left && view_pad_right == pad_right) return;
+    view_enabled = enabled;
+    view_shift = shift;
+    view_pad_left = pad_left;
+    view_pad_right = pad_right;
+}
+
 void sw_wide_configure(int wide_w, int offset) {
     if (wide_w <= 0) { wide_free_all(); g_wide_w = 0; g_wide_off = 0; return; }
     if (wide_w != g_wide_w) wide_free_all();

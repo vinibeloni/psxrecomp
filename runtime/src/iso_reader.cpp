@@ -22,6 +22,76 @@ constexpr size_t RAW_DATA_OFFSET = 24;
 // Primary Volume Descriptor location
 constexpr uint32_t PVD_SECTOR = 16;
 
+constexpr uint32_t CD_FRAMES_PER_SECOND = 75;
+constexpr uint32_t CD_FRAMES_PER_MINUTE = 60 * CD_FRAMES_PER_SECOND;
+constexpr uint32_t CD_LEAD_IN_FRAMES = 2 * CD_FRAMES_PER_SECOND;
+
+static bool valid_bcd(uint8_t value) {
+    return (value & 0x0f) <= 9 && (value >> 4) <= 9;
+}
+
+// Sector size the cue's TRACK modes declare for one FILE: 0 when no track of
+// that file names a size, UINT32_MAX when its tracks disagree.
+static uint32_t cue_declared_sector_size(
+        const std::vector<PSXRecompV4::CueTrackRef>& tracks, size_t file_index) {
+    uint32_t declared = 0;
+    for (const PSXRecompV4::CueTrackRef& t : tracks) {
+        if (t.file_index != file_index || t.sector_size == 0) continue;
+        if (declared != 0 && declared != t.sector_size)
+            return std::numeric_limits<uint32_t>::max();
+        declared = t.sector_size;
+    }
+    return declared;
+}
+
+// Raw (2352) vs cooked (2048) for one stored file. The cue's TRACK mode is
+// the authority. File length is not evidence: a raw dump can carry a partial
+// trailing sector and still be a multiple of 2048, which a length test mounts
+// as a cooked ISO so every read lands mid-sector (LBA 16 reads back zeros and
+// the BIOS gives up with SystemError B/906). Without a cue mode, a raw sector
+// 0 starts with the 12-byte CD sync pattern and an ISO's system area does not;
+// length only decides when sector 0 is unreadable. Returns false for layouts
+// this reader cannot mount (conflicting modes, MODE2/2336).
+static bool stored_file_is_raw(std::ifstream& file, uint64_t size,
+                               uint32_t declared, bool* raw) {
+    if (declared == std::numeric_limits<uint32_t>::max() || declared == 2336)
+        return false;
+    if (declared != 0) {
+        *raw = declared == RAW_SECTOR_SIZE;
+        return true;
+    }
+    static const uint8_t kSync[12] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                                      0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+    uint8_t head[sizeof(kSync)] = {};
+    file.clear();
+    file.seekg(0, std::ios::beg);
+    file.read(reinterpret_cast<char*>(head), sizeof(head));
+    const bool have_head = file.gcount() == (std::streamsize)sizeof(head);
+    file.clear();
+    *raw = have_head ? std::memcmp(head, kSync, sizeof(kSync)) == 0
+                     : (size % RAW_SECTOR_SIZE) == 0;
+    return true;
+}
+
+static uint32_t bcd_to_binary(uint8_t value) {
+    return (value >> 4) * 10u + (value & 0x0f);
+}
+
+static uint8_t binary_to_bcd(uint32_t value) {
+    return static_cast<uint8_t>(((value / 10u) << 4) | (value % 10u));
+}
+
+static uint16_t subq_crc(const uint8_t* data) {
+    uint16_t crc = 0;
+    for (int i = 0; i < 10; ++i) {
+        crc ^= static_cast<uint16_t>(data[i]) << 8;
+        for (int bit = 0; bit < 8; ++bit)
+            crc = (crc & 0x8000) ? static_cast<uint16_t>((crc << 1) ^ 0x1021)
+                                : static_cast<uint16_t>(crc << 1);
+    }
+    return static_cast<uint16_t>(~crc);
+}
+
 enum class CHDTrackMode {
     Mode1,
     Mode1Raw,
@@ -236,6 +306,10 @@ bool ISOReader::Open(const std::string& filename) {
             root_dir_.lba = 0;
             root_dir_.size = 0;
         }
+        if (!LoadSBICompanion(filename)) {
+            Close();
+            return false;
+        }
         return true;
     }
 
@@ -279,7 +353,6 @@ bool ISOReader::Open(const std::string& filename) {
     // Build the segment table: open every file and lay it out at the next
     // disc-relative sector. Every file must open — a multi-file dump with a
     // missing track file would otherwise silently read the wrong sectors.
-    uint32_t next_lba = 0;
     for (const std::string& bin_name : bin_files) {
         BinSegment seg;
         seg.path = bin_name;
@@ -296,24 +369,80 @@ bool ISOReader::Open(const std::string& filename) {
             return false;
         }
         const uint64_t size = static_cast<uint64_t>(file_size);
-        seg.raw          = (size % RAW_SECTOR_SIZE) == 0;
+        if (!stored_file_is_raw(seg.file, size,
+                                cue_declared_sector_size(pending_tracks, segments_.size()),
+                                &seg.raw)) {
+            Close();
+            return false;
+        }
+        // Whole sectors only; a partial trailing sector is not addressable.
         seg.sector_count = static_cast<uint32_t>(size / (seg.raw ? RAW_SECTOR_SIZE
                                                                  : SECTOR_SIZE));
-        seg.start_lba    = next_lba;
-        next_lba += seg.sector_count;
+        seg.start_lba    = 0;  // assigned by the layout pass below
         segments_.push_back(std::move(seg));
     }
 
-    // Convert the pending cue tracks to disc-relative LBAs.
-    for (const PendingTrack& p : pending_tracks) {
-        CDTrack t;
-        t.number    = p.number;
-        t.is_audio  = p.is_audio;
-        t.start_lba = segments_[p.file_index].start_lba + p.index01;
-        t.pregap_lba = segments_[p.file_index].start_lba +
-                       (p.has_index00 ? p.index00 : p.index01);
-        tracks_.push_back(t);
+    // Lay the files out on the disc and convert the pending cue tracks to
+    // disc-relative LBAs. INDEX times are file-relative; a cue PREGAP (before
+    // a track's INDEX 00/01) or POSTGAP (after its data) is a run of sectors
+    // the dump does not store, so it becomes a virtual span and moves every
+    // later disc LBA. Real discs carry those sectors, and games locate tracks
+    // through the TOC (GetTD), so dropping them shifts every later track
+    // earlier than the game expects. Without gap lines each file is one stored
+    // span and the layout is the plain concatenation of the files.
+    uint32_t disc = 0;
+    auto push_stored = [&](size_t seg_index, uint32_t from, uint32_t to) {
+        if (to <= from) return;
+        spans_.push_back({disc, to - from, (int)seg_index, from});
+        disc += to - from;
+    };
+    auto push_virtual = [&](uint32_t count) {
+        if (count == 0) return;
+        spans_.push_back({disc, count, -1, 0});
+        disc += count;
+    };
+    for (size_t si = 0; si < segments_.size(); ++si) {
+        BinSegment& seg = segments_[si];
+        const uint32_t n = seg.sector_count;
+        seg.start_lba = disc;
+        uint32_t cursor = 0;
+        for (size_t pi = 0; pi < pending_tracks.size(); ++pi) {
+            const PendingTrack& p = pending_tracks[pi];
+            if (p.file_index != si) continue;
+            // The track's region in the file starts at INDEX 00 when it has
+            // one; its PREGAP (if any) sits just before that point.
+            const uint32_t region =
+                std::min(std::max(p.has_index00 ? p.index00 : p.index01, cursor), n);
+            push_stored(si, cursor, region);
+            cursor = region;
+
+            CDTrack t;
+            t.number     = p.number;
+            t.is_audio   = p.is_audio;
+            t.pregap_lba = disc;
+            push_virtual(p.pregap);
+            t.start_lba  = disc + (p.index01 > region ? p.index01 - region : 0);
+            tracks_.push_back(t);
+
+            if (p.postgap) {
+                // POSTGAP follows the track's stored data: the next track of
+                // this file starts its region there, else the file ends.
+                uint32_t end = n;
+                for (size_t qi = pi + 1; qi < pending_tracks.size(); ++qi) {
+                    const PendingTrack& q = pending_tracks[qi];
+                    if (q.file_index != si) continue;
+                    end = std::min(std::max(q.has_index00 ? q.index00 : q.index01,
+                                            cursor), n);
+                    break;
+                }
+                push_stored(si, cursor, end);
+                cursor = end;
+                push_virtual(p.postgap);
+            }
+        }
+        push_stored(si, cursor, n);
     }
+    disc_sector_count_ = disc;
 
     // Synthesize a single data track for a bare .bin/.iso or a .cue with no
     // parseable TRACK entries, so TrackCount() is always >= 1.
@@ -337,7 +466,31 @@ bool ISOReader::Open(const std::string& filename) {
         root_dir_.size = 0;
     }
 
+    if (!LoadSBICompanion(filename)) {
+        Close();
+        return false;
+    }
+
     return true;
+}
+
+bool ISOReader::FirstFileIsRaw(const std::string& path, bool* raw) {
+    if (!raw) return false;
+    std::string stored = path;
+    uint32_t declared = 0;
+    if (PSXRecompV4::path_has_extension_ci(std::filesystem::path(path), ".cue")) {
+        const PSXRecompV4::CueSheet sheet =
+            PSXRecompV4::parse_cue_sheet(std::filesystem::path(path));
+        if (!sheet.opened || sheet.files.empty()) return false;
+        stored = sheet.files.front().path.string();
+        declared = cue_declared_sector_size(sheet.tracks, 0);
+    }
+    std::ifstream file(stored, std::ios::binary);
+    if (!file.is_open()) return false;
+    file.seekg(0, std::ios::end);
+    const std::streampos size = file.tellg();
+    if (size <= 0) return false;
+    return stored_file_is_raw(file, static_cast<uint64_t>(size), declared, raw);
 }
 
 void ISOReader::Close() {
@@ -348,7 +501,10 @@ void ISOReader::Close() {
         }
     }
     segments_.clear();
+    spans_.clear();
+    disc_sector_count_ = 0;
     tracks_.clear();
+    subq_replacements_.clear();
     bin_path_.clear();
     volume_id_.clear();
     root_dir_.lba = 0;
@@ -356,11 +512,85 @@ void ISOReader::Close() {
     is_open_ = false;
 }
 
-BinSegment* ISOReader::SegmentForLBA(uint32_t lba) {
-    // Linear scan: images carry a handful of segments (one per track file).
-    for (BinSegment& seg : segments_) {
-        if (lba >= seg.start_lba && lba - seg.start_lba < seg.sector_count) {
-            return &seg;
+bool ISOReader::LoadSBICompanion(const std::string& image_path) {
+    std::filesystem::path path(image_path);
+    path.replace_extension(".sbi");
+    if (!std::filesystem::exists(path)) return true;
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) return false;
+    char header[4] = {};
+    file.read(header, sizeof(header));
+    if (file.gcount() != sizeof(header) ||
+        std::memcmp(header, "SBI\0", sizeof(header)) != 0) {
+        return false;
+    }
+
+    while (true) {
+        uint8_t record[14] = {};
+        file.read(reinterpret_cast<char*>(record), sizeof(record));
+        if (file.gcount() == 0 && file.eof()) break;
+        if (file.gcount() != sizeof(record) || record[3] != 1 ||
+            !valid_bcd(record[0]) || !valid_bcd(record[1]) ||
+            !valid_bcd(record[2])) {
+            return false;
+        }
+        const uint32_t absolute_frame =
+            bcd_to_binary(record[0]) * CD_FRAMES_PER_MINUTE +
+            bcd_to_binary(record[1]) * CD_FRAMES_PER_SECOND +
+            bcd_to_binary(record[2]);
+        if (absolute_frame < CD_LEAD_IN_FRAMES) return false;
+        const uint32_t lba = absolute_frame - CD_LEAD_IN_FRAMES;
+        std::array<uint8_t, 12> subq = {};
+        std::memcpy(subq.data(), record + 4, 10);
+        const uint16_t invalid_crc = static_cast<uint16_t>(subq_crc(subq.data()) ^ 0xffff);
+        subq[10] = static_cast<uint8_t>(invalid_crc);
+        subq[11] = static_cast<uint8_t>(invalid_crc >> 8);
+        if (!subq_replacements_.emplace(lba, subq).second) return false;
+    }
+    return !subq_replacements_.empty();
+}
+
+bool ISOReader::ReadSubChannelQ(uint32_t lba, uint8_t* buffer, bool* valid) const {
+    if (!buffer || !valid || !is_open_) return false;
+    const auto replacement = subq_replacements_.find(lba);
+    if (replacement != subq_replacements_.end()) {
+        std::memcpy(buffer, replacement->second.data(), replacement->second.size());
+        *valid = false;
+        return true;
+    }
+
+    int track = 1;
+    for (const CDTrack& candidate : tracks_) {
+        if (candidate.start_lba > lba) break;
+        track = candidate.number;
+    }
+    const uint32_t track_lba = TrackStartLBA(track);
+    const uint32_t relative = lba >= track_lba ? lba - track_lba : 0;
+    const uint32_t absolute = lba + 150;
+    std::memset(buffer, 0, 12);
+    buffer[0] = TrackIsAudio(track) ? 0x01 : 0x41;
+    buffer[1] = binary_to_bcd(static_cast<uint32_t>(track));
+    buffer[2] = 0x01;
+    buffer[3] = binary_to_bcd(relative / CD_FRAMES_PER_MINUTE);
+    buffer[4] = binary_to_bcd((relative / CD_FRAMES_PER_SECOND) % 60);
+    buffer[5] = binary_to_bcd(relative % CD_FRAMES_PER_SECOND);
+    buffer[6] = binary_to_bcd(absolute / CD_FRAMES_PER_MINUTE);
+    buffer[7] = binary_to_bcd((absolute / CD_FRAMES_PER_SECOND) % 60);
+    buffer[8] = binary_to_bcd(absolute % CD_FRAMES_PER_SECOND);
+    const uint16_t crc = subq_crc(buffer);
+    buffer[10] = static_cast<uint8_t>(crc);
+    buffer[11] = static_cast<uint8_t>(crc >> 8);
+    *valid = true;
+    return true;
+}
+
+const BinSpan* ISOReader::SpanForLBA(uint32_t lba) const {
+    // Linear scan: images carry a handful of spans (one per track file, plus
+    // one per cue gap).
+    for (const BinSpan& span : spans_) {
+        if (lba >= span.disc_start && lba - span.disc_start < span.sector_count) {
+            return &span;
         }
     }
     return nullptr;
@@ -382,11 +612,17 @@ bool ISOReader::ReadSector(uint32_t lba, uint8_t* buffer) {
         return true;
     }
 
-    BinSegment* seg = SegmentForLBA(lba);
-    if (!seg) {
+    const BinSpan* span = SpanForLBA(lba);
+    if (!span) {
         return false;
     }
-    const uint32_t local_lba = lba - seg->start_lba;
+    if (span->segment < 0) {
+        // Cue PREGAP/POSTGAP: not stored in the dump; reads back as zero.
+        std::memset(buffer, 0, SECTOR_SIZE);
+        return true;
+    }
+    BinSegment* seg = &segments_[(size_t)span->segment];
+    const uint32_t local_lba = span->file_sector + (lba - span->disc_start);
 
     // Clear any error flags from a previous failed read
     seg->file.clear();
@@ -432,11 +668,21 @@ bool ISOReader::ReadRawSector(uint32_t lba, uint8_t* buffer) {
 
     if (chd_) return read_chd_raw(*chd_, lba, buffer, nullptr);
 
-    BinSegment* seg = SegmentForLBA(lba);
-    if (!seg || !seg->raw) {
+    const BinSpan* span = SpanForLBA(lba);
+    if (!span) {
         return false;
     }
-    const uint32_t local_lba = lba - seg->start_lba;
+    if (span->segment < 0) {
+        // Cue PREGAP/POSTGAP: not stored in the dump; digital silence, the
+        // same as the CHD path's virtual pregap.
+        std::memset(buffer, 0, RAW_SECTOR_SIZE);
+        return true;
+    }
+    BinSegment* seg = &segments_[(size_t)span->segment];
+    if (!seg->raw) {
+        return false;
+    }
+    const uint32_t local_lba = span->file_sector + (lba - span->disc_start);
 
     seg->file.clear();
     std::streampos offset = static_cast<std::streampos>(local_lba) * RAW_SECTOR_SIZE;
@@ -470,10 +716,7 @@ uint32_t ISOReader::GetSectorCount() {
         return 0;
     }
     if (chd_) return chd_->disc_sector_count;
-    if (segments_.empty()) return 0;
-
-    const BinSegment& last = segments_.back();
-    return last.start_lba + last.sector_count;
+    return disc_sector_count_;
 }
 
 int ISOReader::TrackCount() const {

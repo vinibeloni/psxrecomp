@@ -42,12 +42,14 @@ def make_psxexe():
     for offset in (0x100, 0x200, 0x1100):
         for i, word in enumerate((0x27BDFFF0, 0x03E00008, 0x27BD0010)):
             put32(text, offset + i * 4, word)
-    # Valid primary opcodes with unsupported SPECIAL subfields followed by a
-    # return: discovery admits the entry, then production emission correctly
+    # Valid primary opcodes with unsupported COP0 memory transfers followed by
+    # a return: discovery admits the entry, then production emission correctly
     # demotes the >=50%-untranslatable body to a fail-closed data stub.
+    # Undefined SPECIAL words are now intentionally emitted as compatible
+    # no-ops, so they no longer exercise the untranslatable-data guard.
     for i, word in enumerate((
             0x27BDFFF0,
-            0x00000001, 0x00000001, 0x00000001, 0x00000001, 0x00000001,
+            0xC0000000, 0xC0000000, 0xC0000000, 0xC0000000, 0xC0000000,
             jal(LOAD + 0x100), 0,
             0x03E00008, 0x27BD0010)):
         put32(text, 0x300 + i * 4, word)
@@ -139,6 +141,10 @@ def main():
                 failures.append("dispatch guard does not accept a continuation PC")
             if dispatch.count("entry->range_count, addr)") != 2:
                 failures.append("dispatch guards do not validate from their resume PC")
+            if "int psx_game_text_native_ok_full(uint32_t addr)" not in dispatch:
+                failures.append("full-range straight-line handoff guard was not emitted")
+            if "dirty_ram_text_native_ok_ranges(" not in dispatch:
+                failures.append("full-range handoff guard lost exact range validation")
             if "psx_native_bad_entry(" in full:
                 failures.append("reachable main image incorrectly used overlay codegen")
             if "=== Exact-Entry Function Analysis ===" not in output:

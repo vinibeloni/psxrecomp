@@ -33,6 +33,7 @@
  */
 
 #include "bios_hle.h"
+#include "psx_memory.h"
 
 #include "cpu_state.h"
 #include "psx_cycles.h"
@@ -100,7 +101,7 @@ static void hle_record(uint32_t vector, uint32_t fn, const CPUState* cpu,
      * load-bearing for event-consumption races (MMX6 card check). */
     uint32_t pcb = cpu->read_word(0xA0000108u);
     uint32_t pcb_phys = pcb & 0x1FFFFFFFu;
-    uint32_t tcb = (pcb != 0u && pcb_phys < 0x200000u)
+    uint32_t tcb = (pcb != 0u && pcb_phys < psx_ram_live_bytes())
                        ? cpu->read_word(0xA0000000u | pcb_phys) : 0u;
     extern int psx_get_in_exception(void);
     uint8_t in_exc = (uint8_t)(psx_get_in_exception() ? 1u : 0u);
@@ -181,7 +182,7 @@ static void hle_open_event(CPUState* cpu, uint32_t base, uint32_t n)
         cpu->write_word(ev + EV_STATUS, EVST_DISABLED);
         cpu->gpr[2] = 0xF1000000u | slot;
     }
-    psx_advance_cycles(40u + 6u * (slot == 0xFFFFFFFFu ? n : slot + 1u));
+    psx_cpu_charge(40u + 6u * (slot == 0xFFFFFFFFu ? n : slot + 1u));
 }
 
 /* CloseEvent (kernel 0x1E1C): status=free, return 1. */
@@ -190,7 +191,7 @@ static void hle_close_event(CPUState* cpu, uint32_t base)
     uint32_t ev = base + (cpu->gpr[4] & 0xFFFFu) * EVCB_STRIDE;
     cpu->write_word(ev + EV_STATUS, EVST_FREE);
     cpu->gpr[2] = 1u;
-    psx_advance_cycles(36u);
+    psx_cpu_charge(36u);
 }
 
 /* TestEvent (kernel 0x1EC8): ready => re-arm to enabled and return 1, else 0. */
@@ -203,7 +204,7 @@ static void hle_test_event(CPUState* cpu, uint32_t base)
     } else {
         cpu->gpr[2] = 0u;
     }
-    psx_advance_cycles(40u);
+    psx_cpu_charge(40u);
 }
 
 /* EnableEvent (kernel 0x1F10) / DisableEvent (kernel 0x1F4C): a non-free
@@ -215,7 +216,7 @@ static void hle_set_event_status(CPUState* cpu, uint32_t base, uint32_t status)
     if (cpu->read_word(ev + EV_STATUS) != EVST_FREE)
         cpu->write_word(ev + EV_STATUS, status);
     cpu->gpr[2] = 1u;
-    psx_advance_cycles(40u);
+    psx_cpu_charge(40u);
 }
 
 /* DeliverEvent (kernel 0x1B44): for every ENABLED EvCB matching class+spec,
@@ -235,10 +236,9 @@ static void hle_deliver_event(CPUState* cpu, uint32_t base, uint32_t n)
             cpu->write_word(ev + EV_STATUS, EVST_READY);
         } else if (mode == EVMD_CALLBACK) {
             uint32_t func = cpu->read_word(ev + EV_FUNC);
-            /* deliver_event_ret == 0 never reaches here: main.cpp forces the
-             * whole HLE tier off when the linked BIOS exports no anchor
-             * (dropping a callback silently is NOT an acceptable fallback,
-             * so the gate lives at tier selection, not per-event). */
+            /* deliver_event_ret == 0 never reaches here: configure() refuses
+             * call-HLE when the linked BIOS exports no anchor (dropping a
+             * callback silently wedges Ape LOAD card EvCBs). */
             if (func != 0 && psx_bios_image.deliver_event_ret != 0) {
                 /* Nested guest call, same shape as any compiled call site.
                  * $ra is the kernel's real post-jalr address so the callback
@@ -260,7 +260,7 @@ static void hle_deliver_event(CPUState* cpu, uint32_t base, uint32_t n)
      * caller may depend on it (libapi types DeliverEvent void). Set 0 for a
      * stable, observable value. */
     cpu->gpr[2] = 0u;
-    psx_advance_cycles(36u + 12u * n);
+    psx_cpu_charge(36u + 12u * n);
 }
 
 /* B0 vector service. Returns 1 iff serviced in HLE. */
@@ -331,7 +331,12 @@ static int bios_hle_dispatch(struct CPUState* cpu, uint32_t phys)
 
 void psx_bios_hle_configure(int call_hle, int boot_skip)
 {
-    s_call_hle_on  = call_hle ? 1 : 0;
+    /* IMPORTANT (Ape Escape + OpenBIOS): clamp call-HLE to deliver_event_ret.
+     * OpenBIOS omits the anchor; servicing B0:07 without it silently skips
+     * CALLBACK EvCBs (HwCARD/SwCARD flag handlers at 0x80022930/0x80022980
+     * never run → LOAD phase waits never complete). Plan should already
+     * refuse; this is the runtime backstop. Boot-skip remains independent. */
+    s_call_hle_on  = (call_hle && psx_bios_image.deliver_event_ret != 0) ? 1 : 0;
     /* Clamp to what THIS image can actually do, so the state the banner and
      * `hle_dump` report can never claim a skip that bios_hle_dispatch below is
      * structurally unable to perform. Callers are expected to have gone

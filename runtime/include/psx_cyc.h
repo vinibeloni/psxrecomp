@@ -34,6 +34,7 @@
 #endif
 #include "cpu_state.h"   /* CPUState (guard-safe: cpu_state.h includes us last) */
 #include "psx_cycles.h"  /* inline psx_advance_cycles */
+#include "psx_memory.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,6 +51,8 @@ enum { PSX_CYC_BATCH_SOFT = 64u };
 static inline void psx_cyc_bb_defer_begin(void) { }
 static inline void psx_cyc_bb_defer_end(void) { }
 static inline void psx_cyc_bb_defer_flush(void) { overlay_flush_cycles(); }
+static inline void psx_cyc_local_begin(uint32_t *acc) { (void)acc; }
+static inline void psx_cyc_local_end(void) { }
 #else
 static inline void psx_cyc_bb_defer_begin(void) { g_psx_cyc_bb_defer++; }
 static inline void psx_cyc_bb_defer_end(void) {
@@ -57,6 +60,23 @@ static inline void psx_cyc_bb_defer_end(void) {
     if (g_psx_cyc_bb_defer == 0) psx_cyc_batch_flush();
 }
 static inline void psx_cyc_bb_defer_flush(void) { psx_cyc_batch_flush(); }
+
+/* Install a function-local charge sink (MotK VLC leaves). Soft-cap publish
+ * at 1<<28 so uint32 cannot wrap; IRQ/MMIO still go through batch_flush. */
+static inline void psx_cyc_local_begin(uint32_t *acc) {
+#if !defined(PSX_COSIM)
+    if (acc) *acc = 0;
+    g_psx_cyc_local_acc = acc;
+#else
+    (void)acc;
+#endif
+}
+static inline void psx_cyc_local_end(void) {
+#if !defined(PSX_COSIM)
+    psx_cyc_local_publish();
+    g_psx_cyc_local_acc = NULL;
+#endif
+}
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -64,13 +84,65 @@ static inline void psx_cyc_bb_defer_cleanup(int *guard) {
     (void)guard;
     psx_cyc_bb_defer_end();
 }
+static inline void psx_cyc_local_cleanup(uint32_t **guard) {
+    (void)guard;
+    psx_cyc_local_end();
+}
 #endif
 
 static inline void psx_cyc_charge(uint32_t cycles) {
     if (cycles == 0u) return;
 #if defined(PSX_OVERLAY_DLL_BUILD)
-    psx_advance_cycles(cycles);
+    psx_cpu_charge(cycles);
 #else
+    /* [timing] guest_cycle_scale: a scaled charge is the CPU charge itself
+     * (the one place CPU work is scaled); the batch below is the scale-1
+     * production path, unchanged. */
+    if (PSX_GCS_ACTIVE()) {
+        /* Opt-in ([timing] guest_cycle_scale_batch, PSX_GCS_BATCH=0/1): scale
+         * here, exactly as psx_cpu_charge would (same fractional carry, same
+         * order), then batch the scaled cycles like the scale-1 path instead
+         * of publishing every 1-cycle step to the devices. The batch is
+         * flushed at the same observation points (stores, MMIO, interrupt
+         * checks, deadlines) as at scale 1. */
+        if (!g_psx_gcs_batch) {
+            psx_cpu_charge(cycles);
+            return;
+        }
+        cycles = psx_gcs_scale(cycles);
+        if (cycles == 0u) return;
+#if !defined(PSX_COSIM)
+        /* Publish on the guest clock alone: the device deadline or the soft
+         * cap. The scale-1 path below also defers while g_psx_cyc_bb_defer is
+         * nonzero and routes through the VLC local sink; both are host call-
+         * stack state (longjmp escapes leak or reset the depth), so which
+         * charge published the batch -- and so which device saw which clock
+         * when -- differed between a Mac and a Windows peer, and the scaled
+         * race split by a few cycles (R4 2P Mac<->PC: clk/tim fork at ~3296
+         * with cpu/ram equal; matching with the batch off). */
+        if (!g_ls_replay_active && !g_event_step_conservative &&
+            !psx_in_device_service) {
+            uint32_t prior = g_psx_cyc_batch;
+            uint32_t sum = prior + cycles;
+            if (sum >= prior) {
+                if (prior == 0u) {
+                    uint64_t room = 0u;
+                    if (psx_next_service_cycle > psx_cycle_count)
+                        room = psx_next_service_cycle - psx_cycle_count;
+                    g_psx_cyc_batch_limit = room == 0u ? 1u :
+                        (room < (uint64_t)PSX_CYC_BATCH_SOFT
+                            ? (uint32_t)room : (uint32_t)PSX_CYC_BATCH_SOFT);
+                }
+                if (sum < g_psx_cyc_batch_limit) {
+                    g_psx_cyc_batch = sum;
+                    return;
+                }
+            }
+            psx_advance_cycles(cycles);
+            return;
+        }
+#endif
+    }
 #if defined(__GNUC__) || defined(__clang__)
     if (__builtin_expect(g_ls_replay_active | g_event_step_conservative, 0)) {
 #else
@@ -84,6 +156,23 @@ static inline void psx_cyc_charge(uint32_t cycles) {
         return;
     }
 #if !defined(PSX_COSIM)
+    /* Emitter-gated VLC path: stack local, no deadline probe. */
+    if (g_psx_cyc_local_acc) {
+        uint32_t prior = *g_psx_cyc_local_acc;
+        if (cycles <= UINT32_MAX - prior && (prior + cycles) < (1u << 28)) {
+            *g_psx_cyc_local_acc = prior + cycles;
+            return;
+        }
+        *g_psx_cyc_local_acc = 0;
+        {
+            uint32_t *saved = g_psx_cyc_local_acc;
+            g_psx_cyc_local_acc = NULL;
+            if (prior) psx_advance_cycles(prior);
+            g_psx_cyc_local_acc = saved;
+        }
+        *g_psx_cyc_local_acc = cycles;
+        return;
+    }
     {
         uint32_t prior = g_psx_cyc_batch;
         uint32_t sum = prior + cycles;
@@ -210,7 +299,7 @@ static inline uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
             cpu->ld_which_t = (uint8_t)rt;
         }
         uint32_t value;
-        memcpy(&value, g_psx_ram + (phys & 0x1FFFFFu), sizeof(value));
+        memcpy(&value, g_psx_ram + (phys & g_psx_ram_mask), sizeof(value));
         return value;
     }
     return psx_cyc_load_word_slow(cpu, addr, rt, reg_mask);
@@ -240,7 +329,7 @@ static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
             cpu->ld_which_t = (uint8_t)rt;
         }
         uint16_t value;
-        memcpy(&value, g_psx_ram + (phys & 0x1FFFFFu), sizeof(value));
+        memcpy(&value, g_psx_ram + (phys & g_psx_ram_mask), sizeof(value));
         return value;
     }
     return psx_cyc_load_half_slow(cpu, addr, rt, reg_mask);

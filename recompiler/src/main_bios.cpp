@@ -41,10 +41,13 @@
 
 #include "bios_slice_walker.h"
 #include "bios_rom_alias.h"
+#include "host_path.h"
 #include "config_loader.h"
 #include "full_function_emitter.h"
 #include "function_discovery.h"
 #include "mips_decoder.h"
+#include "ps1_exe_parser.h"
+#include "write_if_changed.h"
 
 namespace fs = std::filesystem;
 
@@ -185,19 +188,8 @@ std::vector<uint8_t> load_file_strict(const fs::path& p, size_t expected_size) {
 }
 
 void write_file(const fs::path& p, const std::string& content) {
-    fs::create_directories(p.parent_path());
-    const fs::path tmp = p.string() + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        if (!f) {
-            throw std::runtime_error(fmt::format("cannot open output file for write: {}", tmp.string()));
-        }
-        f.write(content.data(), static_cast<std::streamsize>(content.size()));
-        if (!f) {
-            throw std::runtime_error(fmt::format("write error on: {}", tmp.string()));
-        }
-    }
-    fs::rename(tmp, p);
+    // Preserve mtime when bytes match (Ninja incremental after regen).
+    (void)write_file_if_changed(p, content);
 }
 
 // ----- Output emission ---------------------------------------------------
@@ -711,6 +703,8 @@ std::string make_unsupported_json_discovery(const PSXRecompV4::DiscoveryResult& 
 
 int run_boot_slice(const fs::path& bios_path, const fs::path& out_dir,
                    const std::optional<std::string>& cc_override) {
+    fs::create_directories(out_dir);
+
     // 1. Load + validate BIOS file.
     const auto rom = load_file_strict(bios_path, kBiosSize);
     const std::string sha = sha256_hex(rom);
@@ -770,6 +764,48 @@ int run_boot_slice(const fs::path& bios_path, const fs::path& out_dir,
     return 0;
 }
 
+// ----- Segment-qualified seeds -----------------------------------------------
+
+// A runtime PC inside a relocated copy window, in another segment than the
+// window runs in, asks for a segment variant of the code at those ROM bytes
+// (docs/SEGMENT_AWARE_CODE.md §5.4; SCPH-1001's kernel entry 0xA0000500). It
+// is not a discovery seed, because discovery works on ROM addresses: move it
+// out of `seeds` and return it with the ROM VA of its bytes. Only KUSEG below
+// 0x20000000, KSEG0 and KSEG1 alias the window; a seed in any other segment
+// names no code (it addresses no RAM) and stops the build.
+std::vector<PSXRecompV4::BiosSegmentVariantSeed> split_segment_variant_seeds(
+        std::vector<PSXRecompV4::Seed>& seeds,
+        const PSXRecompV4::BiosAddressModel& model) {
+    std::vector<PSXRecompV4::BiosSegmentVariantSeed> variants;
+    std::vector<PSXRecompV4::Seed> rom_seeds;
+    for (const auto& sd : seeds) {
+        const uint32_t phys = sd.address & 0x1FFFFFFFu;
+        const uint32_t seg = sd.address & 0xE0000000u;
+        bool variant = false;
+        for (const auto& c : model.copies()) {
+            const uint32_t rt = c.runtime_base & 0x1FFFFFFFu;
+            if (phys >= rt && phys - rt < c.len() && seg != (c.runtime_base & 0xE0000000u)) {
+                if (!PSXRecomp::maps_physical(sd.address)) {
+                    throw std::runtime_error(fmt::format(
+                        "seed 0x{:08X} ({}) is in segment 0x{:08X}, which does not map "
+                        "physical memory (only KUSEG below 0x20000000, KSEG0 and KSEG1 "
+                        "do), so it cannot ask for a segment variant of the '{}' window "
+                        "(docs/SEGMENT_AWARE_CODE.md §5.4); that window runs its bytes at "
+                        "0x{:08X}", sd.address, sd.label, seg, c.name,
+                        c.runtime_base + (phys - rt)));
+                }
+                variants.push_back({sd.address, 0xA0000000u | (c.rom_lo + (phys - rt)),
+                                    sd.label});
+                variant = true;
+                break;
+            }
+        }
+        if (!variant) rom_seeds.push_back(sd);
+    }
+    seeds = std::move(rom_seeds);
+    return variants;
+}
+
 // ----- Phase 2: full BIOS emission ------------------------------------------
 
 int run_emit_full(const fs::path& bios_path, const fs::path& out_dir,
@@ -779,6 +815,9 @@ int run_emit_full(const fs::path& bios_path, const fs::path& out_dir,
                   const std::string& declared_sha = {},
                   const std::vector<PSXRecompV4::BiosVectorTable>& bios_vectors = {},
                   const std::vector<PSXRecompV4::BiosAlias>& bios_aliases = {}) {
+    // Setup zips omit generated/; ensure the out_dir exists before emit.
+    fs::create_directories(out_dir);
+
     // 0. Activate the profile's address model — the single source of truth
     // for every relocation window discovery and the emitter use.
     PSXRecompV4::FullFunctionEmitter::set_address_model(&model);
@@ -802,12 +841,18 @@ int run_emit_full(const fs::path& bios_path, const fs::path& out_dir,
 
     // 2. Load seeds.
     auto seeds = load_seeds(seed_path);
+    const auto variant_seeds = split_segment_variant_seeds(seeds, model);
     const size_t vector_seed_count =
         add_bios_vector_target_seeds(seeds, rom, kBiosBase,
                                      kBiosBase + static_cast<uint32_t>(kBiosSize) - 1,
                                      bios_vectors);
     std::fprintf(stdout, "psxrecomp-bios: loaded %zu seeds from %s\n",
-                 seeds.size(), seed_path.string().c_str());
+                 seeds.size() + variant_seeds.size(), seed_path.string().c_str());
+    for (const auto& vs : variant_seeds) {
+        std::fprintf(stdout,
+            "psxrecomp-bios: segment-variant seed 0x%08X (%s): ROM 0x%08X compiled for "
+            "segment 0x%08X\n", vs.pc, vs.label.c_str(), vs.rom, vs.pc & 0xE0000000u);
+    }
     if (vector_seed_count != 0) {
         std::fprintf(stdout,
             "psxrecomp-bios: added %zu ROM-resident BIOS vector target seeds\n",
@@ -854,13 +899,25 @@ int run_emit_full(const fs::path& bios_path, const fs::path& out_dir,
     // 4. Emit full C.
     const auto stats = PSXRecompV4::FullFunctionEmitter::emit(
         rom, kBiosBase, kBiosBase + static_cast<uint32_t>(kBiosSize) - 1,
-        dr, sha, out_dir.string(), out_stem, bios_vectors, bios_aliases);
+        dr, sha, out_dir.string(), out_stem, bios_vectors, bios_aliases, variant_seeds);
 
     std::fprintf(stdout,
-        "psxrecomp-bios: EMIT OK  emitted=%u  skipped=%u  instructions=%u  "
+        "psxrecomp-bios: EMIT OK  emitted=%u  interpreted=%u  skipped=%u  instructions=%u  "
         "dispatch_entries=%u\n",
-        stats.functions_emitted, stats.functions_skipped,
+        stats.functions_emitted, stats.functions_interpreted, stats.functions_skipped,
         stats.total_instructions, stats.dispatch_entries);
+    if (stats.variant_functions != 0) {
+        std::fprintf(stdout,
+            "psxrecomp-bios: segment variants: %u function(s), %u exact-PC dispatch row(s)\n",
+            stats.variant_functions, stats.variant_entries);
+    }
+
+    if (stats.functions_interpreted > 0) {
+        std::fprintf(stdout, "psxrecomp-bios: interpreter fallbacks:\n");
+        for (const auto& [addr, reason] : stats.interpreted) {
+            std::fprintf(stdout, "  0x%08X: %s\n", addr, reason.c_str());
+        }
+    }
 
     if (stats.functions_skipped > 0) {
         std::fprintf(stdout, "psxrecomp-bios: skipped functions:\n");
@@ -877,6 +934,8 @@ int run_emit_full(const fs::path& bios_path, const fs::path& out_dir,
 int run_discover(const fs::path& bios_path, const fs::path& out_dir,
                  const fs::path& seed_path,
                  const PSXRecompV4::BiosAddressModel& model) {
+    fs::create_directories(out_dir);
+
     // 0. Activate the profile's address model (discovery follows J/JAL
     // targets through its relocation windows).
     PSXRecompV4::FunctionDiscovery::set_address_model(&model);
@@ -885,10 +944,12 @@ int run_discover(const fs::path& bios_path, const fs::path& out_dir,
     const auto rom = load_file_strict(bios_path, kBiosSize);
     const std::string sha = sha256_hex(rom);
 
-    // 2. Load seeds.
-    const auto seeds = load_seeds(seed_path);
+    // 2. Load seeds. Segment-variant seeds are an emission request, not
+    // discovery input.
+    auto seeds = load_seeds(seed_path);
+    const size_t variant_seed_count = split_segment_variant_seeds(seeds, model).size();
     std::fprintf(stdout, "psxrecomp-bios: loaded %zu seeds from %s\n",
-                 seeds.size(), seed_path.string().c_str());
+                 seeds.size() + variant_seed_count, seed_path.string().c_str());
 
     // 3. Run discovery.
     const auto dr = PSXRecompV4::FunctionDiscovery::discover(
@@ -965,9 +1026,9 @@ int main(int argc, char** argv) {
             } else if (a.rfind("--config=", 0) == 0) {
                 config_path = a.substr(std::string("--config=").size());
             } else if (a == "--rom" && i + 1 < argc) {
-                config_rom_override = fs::absolute(argv[++i]);
+                config_rom_override = PSXRecompV4::host_absolute(argv[++i]);
             } else if (a == "--out-dir" && i + 1 < argc) {
-                config_out_override = fs::absolute(argv[++i]);
+                config_out_override = PSXRecompV4::host_absolute(argv[++i]);
             }
         }
         if (config_path) {

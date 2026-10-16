@@ -12,9 +12,19 @@ void sio_snapshot_write(uint8_t *p);
 int sio_snapshot_read(const uint8_t *p, uint32_t len);
 
 uint32_t i_stat = 0;
+uint32_t i_mask = 0;
 uint32_t g_debug_current_func_addr = 0;
+uint32_t g_debug_last_store_pc = 0;
 int psx_get_in_exception(void) { return 0; }
 uint8_t psx_read_byte(uint32_t addr) { (void)addr; return 0; }
+uint32_t psx_read_word(uint32_t addr) { (void)addr; return 0; }
+
+/* sio.c gates card-transfer deferral on `psx_get_cycle_count() < deadline`, so
+ * a constant clock would defer forever. Advance monotonically. */
+uint64_t psx_get_cycle_count(void) {
+    static uint64_t t;
+    return t += 64;
+}
 uint32_t memory_get_sr(void) { return 0; }
 void debug_server_poll(void) {}
 void debug_server_log_sio_write(uint32_t a, uint32_t v, uint8_t w) {
@@ -160,10 +170,19 @@ int main(void) {
     EXPECT("snapshot.current.small", 0x01, small);
     EXPECT("snapshot.current.large", 0x80, large);
 
-    /* The final 16 bytes are the new rumble fields. Truncating them models a
-     * v1.0.4 SIO section and must load safely with both motors stopped. */
+    /* The pad-mode section (0x44 lock + device) and the JogCon rollback
+     * fields each add four bytes for a two-seat build. Removing them restores
+     * the preceding formats; removing all twenty-four trailing bytes models a
+     * pre-rumble state. */
+    EXPECT("snapshot.pre-pad-mode.read", 1,
+           sio_snapshot_read(snapshot, snapshot_len - 4));
+    EXPECT("snapshot.pre-jogcon.read", 1,
+           sio_snapshot_read(snapshot, snapshot_len - 8));
+    EXPECT("snapshot.pre-jogcon.small", 0x01,
+           (sio_get_pad_rumble(0, &small, &large), small));
+    EXPECT("snapshot.pre-jogcon.large", 0x80, large);
     EXPECT("snapshot.legacy.read", 1,
-           sio_snapshot_read(snapshot, snapshot_len - 16));
+           sio_snapshot_read(snapshot, snapshot_len - 24));
     sio_get_pad_rumble(0, &small, &large);
     EXPECT("snapshot.legacy.small", 0x00, small);
     EXPECT("snapshot.legacy.large", 0x00, large);

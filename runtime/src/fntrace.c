@@ -1,6 +1,7 @@
 /* fntrace.c — runtime side of psx_dispatch call ring. See fntrace.h. */
 
 #include "fntrace.h"
+#include "psx_bss.h"
 #include "text_xlate.h"     /* on-the-fly string translation hook (framework) */
 #include "parity_trace.h"   /* general control-flow parity ring (native producer) */
 #include "mod_runtime.h"
@@ -17,8 +18,9 @@ static uint32_t parity_rw_cb(void* ctx, uint32_t addr) {
 uint32_t parity_host_frame(void) { extern uint64_t s_frame_count; return (uint32_t)s_frame_count; }
 uint64_t parity_host_cycle(void) { extern uint64_t psx_get_cycle_count(void); return psx_get_cycle_count(); }
 
-FntraceEntry g_fntrace_ring[FNTRACE_RING_CAP];
-uint64_t     g_fntrace_seq = 0;
+/* Explicit .bss: without this, MinGW+LTO can emit ~144MiB of zeros into .rdata. */
+PSX_BSS FntraceEntry g_fntrace_ring[FNTRACE_RING_CAP];
+uint64_t             g_fntrace_seq = 0;
 
 /* Frame counter shared with debug_server.c / dirty_ram_interp.c. */
 extern uint64_t s_frame_count;
@@ -44,6 +46,7 @@ void fntrace_set_game_range(uint32_t lo, uint32_t hi) {
 }
 
 int fntrace_is_game_started(void) { return s_game_started; }
+void fntrace_restore_game_started(int started) { s_game_started = started != 0; }
 
 /* Centralised game-start transition.  Idempotent — safe to call from both
  * the dispatcher (fntrace_record) and the generated entry-point function.
@@ -69,7 +72,19 @@ void fntrace_mark_game_started(CPUState* cpu) {
 void fntrace_maybe_mark_game_started(CPUState* cpu, uint32_t addr) {
     if (s_game_started) return;
     if (s_game_entry_phys == 0) return;   /* no game range armed */
-    if ((addr & 0x1FFFFFFFu) == s_game_entry_phys)
+    /* The dirty-RAM interpreter path may miss the exact PS-X EXE entry when
+     * the BIOS or loader enters game text through already-interpreted flow.
+     * Mirror fntrace_record's safe fallback: only latch on other game-text
+     * addresses when a reference image exists and live RAM already matches it.
+     * Without that guard, relocated BIOS shell RAM can look like game RAM and
+     * a premature handoff corrupts boot. */
+    extern int psx_game_address_in_text(uint32_t addr);
+    extern int psx_game_text_native_ok(uint32_t addr);
+    extern int dirty_ram_text_image_registered(void);
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    if (phys == s_game_entry_phys ||
+        (dirty_ram_text_image_registered() &&
+         psx_game_address_in_text(addr) && psx_game_text_native_ok(addr)))
         fntrace_mark_game_started(cpu);
 }
 
@@ -206,15 +221,7 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
          * latching game-start before the EXE has loaded and clearing the dirty
          * baseline mid-load (the v0.0.2/v0.0.3 release-install boot crash).
          * Without an image, only the exact entry_pc dispatch may latch. */
-        extern int psx_game_address_in_text(uint32_t addr);
-        extern int psx_game_text_native_ok(uint32_t addr);
-        extern int dirty_ram_text_image_registered(void);
-        uint32_t _tphys = target & 0x1FFFFFFFu;
-        if (_tphys == s_game_entry_phys ||
-            (dirty_ram_text_image_registered() &&
-             psx_game_address_in_text(target) && psx_game_text_native_ok(target))) {
-            fntrace_mark_game_started(cpu);
-        }
+        fntrace_maybe_mark_game_started(cpu, target);
     }
     /* Honor the one-shot capture freeze (insn_freeze): once latched, the ring
      * preserves the pre-divergence window instead of evicting it. */
