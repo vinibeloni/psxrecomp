@@ -17353,8 +17353,10 @@ int main(int argc, char** argv) {
      * activation plugins apply them after launcher/settings resolution. */
     constexpr bool ws_offered = false;
     constexpr bool ws_ultrawide_offered = false;
-    constexpr bool frame_interpolation_offered = false;
-    constexpr bool skip_fmv_offered = false;
+    /* static so the static_assert inside start_mod_session's lambda sees a
+     * constant on MSVC, which rejects a by-reference capture of a local. */
+    static constexpr bool frame_interpolation_offered = false;
+    static constexpr bool skip_fmv_offered = false;
     /* Load acceleration is likewise mod-owned (Fast Loading / CD Speed). The
      * former game.toml `offer_turbo_loads` opt-out is deprecated and ignored:
      * offering the generic switch is no longer possible for any title, so a

@@ -3360,16 +3360,16 @@ int  gl_renderer_get_wide_fast(void) { return s_wide_fast; }
  * flip between any two primitives. Like their neighbours the setters sync
  * with a live render thread first (GL_RT_SYNC), so a change never lands in
  * the middle of a replayed frame; they are safe at session_reboot. */
-static int s_pgxp_render_wanted = 0;   /* any PGXP renderer feature on */
+static _Atomic int s_pgxp_render_wanted = 0;   /* any PGXP renderer feature on */
 static void pgxp_render_wanted_update(void) {
     /* Bloom marks PGXP-proven 3D triangles as its sources, so it wants the
      * per-triangle depth too (it never enables the depth test). */
-    __atomic_store_n(&s_pgxp_render_wanted,
-                     (s_pgxp_depth || s_pgxp_cpersp || s_pgxp_seam || s_bcls_on) ? 1 : 0,
-                     __ATOMIC_RELEASE);
+    atomic_store_explicit(&s_pgxp_render_wanted,
+                          (s_pgxp_depth || s_pgxp_cpersp || s_pgxp_seam || s_bcls_on) ? 1 : 0,
+                          memory_order_release);
 }
 int gl_renderer_pgxp_render_wanted(void) {
-    return __atomic_load_n(&s_pgxp_render_wanted, __ATOMIC_ACQUIRE);
+    return atomic_load_explicit(&s_pgxp_render_wanted, memory_order_acquire);
 }
 void gl_renderer_set_pgxp_depth(int on) {
     GL_RT_SYNC("set_pgxp_depth");

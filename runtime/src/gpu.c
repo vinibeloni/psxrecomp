@@ -7452,6 +7452,17 @@ static void gp0_dispatch_command(uint8_t opcode) {
             gp0_exec_vram_to_cpu();
             break;
 
+        case 0x1F:
+            /* GP0(1Fh) Interrupt Request: latch IRQ1 in GPUSTAT.24 and raise
+             * the GPU line in I_STAT on the rising edge. Acked by GP1(02h).
+             * Reachable from a linked list walking a stale or overwritten
+             * packet, which the real GPU consumes without halting. */
+            if (!irq1_flag) {
+                irq1_flag = 1;
+                psx_irq_raise(1, 0); /* IRQ_GPU */
+            }
+            break;
+
         default:
             /* NOP range: 0x03-0x1E, 0xE0, 0xE7-0xEF, 0xFF */
             if ((opcode >= 0x03 && opcode <= 0x1E) ||
